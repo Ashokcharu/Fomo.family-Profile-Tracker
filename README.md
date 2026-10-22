@@ -68,3 +68,5 @@ python -m pytest -q
 ## GitHub Hygiene
 
 `.gitignore` excludes `.env` files, SQLite/database files, virtual environments, Python caches, and the entire local `data/` directory (including browser profiles and follower state). `.env.example` is the safe configuration template to commit. If local data or credentials were committed previously, `.gitignore` alone will not remove them from Git history; untrack them and rotate any exposed credentials before pushing.
+=======
+# Fomo.family-Profile-Tracker
