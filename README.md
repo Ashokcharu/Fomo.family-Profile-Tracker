@@ -1,29 +1,26 @@
-# Fomo Profile Tracker
+# Fomo Family Profile Tracker
 
-Fomo Profile Tracker is a local on-chain research dashboard for following Fomo Family traders, tracking token market data, comparing trader picks, and ranking tracked tokens with AI-assisted analysis.
+Fomo Family Profile Tracker is a local on-chain research dashboard. It tracks tokens and Fomo Family trader activity, records market history, compares trader picks, and ranks active tracked tokens for review.
 
-The FastAPI backend and browser dashboard run together at `http://localhost:8000`. SQLite is the default database, so PostgreSQL and Redis are not required for a local setup.
+The web dashboard and FastAPI service run together at `http://localhost:8000`. The default database is a local SQLite file; PostgreSQL and Redis are optional for local development.
 
-## Features
+## What You Can Do
 
-- **The Tokens:** Track contracts across supported chains and review current market cap, liquidity, holders, followed-trader buyers, and growth.
-- **Traders:** Follow Fomo Family profiles, record their buys, and compare historical picks using success rates, growth, and failure estimates.
-- **AI Discovery:** Rank active tokens from The Tokens using tracked market signals. Ollama (`qwen3:8b` by default) assesses the top signal candidate; other candidates retain transparent signal scores. Results are saved for the AI Discovery tab.
-- **Research views:** Keep favorites, graduated tokens, risk findings, and dismissed tokens separate from active tracking.
+- **The Tokens:** Add contracts and review market cap, liquidity, holders, followed-trader buyers, and growth.
+- **Traders:** Follow Fomo Family profiles and review their qualifying picks, historical growth, success rates, and risk estimates.
+- **AI Discovery:** Analyze only active tokens from The Tokens, then review ranked candidates, evidence, risks, and local-model assessment.
+- **Favorites and research views:** Save tokens for later and review graduations, risk findings, or dismissed tokens separately.
 
-## How It Works
+## Setup
 
-1. Add token contracts in **The Tokens**, and add Fomo Family usernames in **Traders**.
-2. When the browser monitor is enabled, it opens or attaches to a local Chrome profile, reads followed profiles, and records new buy activity. Sign in to Fomo Family in that browser when prompted. Duplicate swap events are ignored.
-3. The market refresh worker requests token metrics from DexScreener every `TOKEN_REFRESH_INTERVAL_SECONDS` (300 seconds by default). It stores snapshots and updates token growth and graduation/risk tracking. Fomo holder data comes from the authenticated browser monitor when available.
-4. **AI Discovery** analyzes only active tokens in The Tokens. It excludes tokens that are favorited, dismissed, graduated, or currently flagged for risk, then ranks up to 30 using market-cap fit, liquidity, followed-trader buyers, observed growth, and holder count.
-5. The scan runs as a background job. The signal-ranked candidates appear while the local model assesses the top candidate. Its score is blended with the tracked-signal score, then the list is reranked. The tab checks for completion automatically. If Ollama is unavailable or returns an invalid assessment, the signal score remains available.
+### Prerequisites
 
-AI results are research signals, not price predictions or realized trading returns. A local 8B model can take several minutes, depending on hardware and the size of the tracked-token list.
+- Python 3.12 or newer
+- Git
+- Ollama with `qwen3:8b` for local-model assessments (optional; signal-based ranking still works without it)
+- Chrome and a Fomo Family sign-in for automatic trader-activity monitoring (optional)
 
-## Quick Start
-
-Requirements: Python 3.12 or newer, Git, and (for model-assisted discovery) Ollama with `qwen3:8b` installed.
+### Install and run
 
 ```bash
 git clone <your-repository-url>
@@ -36,37 +33,42 @@ ollama pull qwen3:8b
 python main.py
 ```
 
-Open `http://localhost:8000`. The API documentation is at `http://localhost:8000/docs`.
+Open `http://localhost:8000`. Interactive API documentation is available at `http://localhost:8000/docs`.
 
-The `.env.example` defaults to SQLite at `./app.db`, enables AI Discovery, and enables the Fomo browser monitor. To run without the monitor, override it in the shell:
+On startup, the app creates missing database tables. With the example settings, it stores data in `app.db` and starts the Fomo Family browser monitor. Sign in to Fomo Family in the opened browser when prompted. Set `FOMO_ACTIVITY_MONITOR_ENABLED=false` in `.env` to run without browser monitoring.
 
-```bash
-FOMO_ACTIVITY_MONITOR_ENABLED=false python main.py
-```
+## How the App Works
 
-To use a different port, set `PORT`, for example `PORT=8001 python main.py`.
+1. Add contract addresses in **The Tokens** and usernames in **Traders**.
+2. The browser monitor checks followed Fomo Family profiles and records new buy events. Duplicate swaps are ignored.
+3. Every `TOKEN_REFRESH_INTERVAL_SECONDS` (300 seconds by default), the market worker fetches token metrics from DexScreener and stores snapshots. These snapshots support growth, graduation, and risk calculations. Fomo holder data is included when the authenticated browser monitor can provide it.
+4. Trader performance uses each trader-token buy relationship separately. A qualifying pick starts with the first detected buy below $50,000 market cap; its original reached market cap (RMC) is preserved while the highest later observation (RH) is tracked. The score estimates token-picking performance, not realized trading profit.
+5. Select **Analyze tracked tokens** in **AI Discovery** to queue a background scan. It considers active tokens from The Tokens only; favorited, dismissed, graduated, or risk-flagged tokens are excluded. It ranks up to 30 candidates from market-cap fit, liquidity, followed-trader buyers, observed growth, and holder count.
+6. Ollama (`qwen3:8b` by default) reviews the top signal candidate and its score is blended into the ranking. Other candidates retain their transparent signal scores. The tab updates while the scan runs. If Ollama is unavailable or returns an invalid assessment, signal-ranked results are still available.
+
+AI output is a research aid, not financial advice, a price prediction, or a statement of realized returns. The local 8B model may take several minutes depending on hardware and tracked-token volume.
 
 ## Configuration
 
-- `DATABASE_URL`: SQLite by default. The Compose file also provides optional PostgreSQL and Redis services; PostgreSQL can be selected with `postgresql+psycopg://postgres:postgres@localhost:5432/meme_intelligence` after starting the `postgres` service.
-- `FOMO_ACTIVITY_MONITOR_ENABLED`: Enables browser-based Fomo Family following and buy monitoring. The monitor uses the local browser profile configured by `FOMO_ACTIVITY_BROWSER_PROFILE_DIR`.
-- `TOKEN_REFRESH_INTERVAL_SECONDS`: Market snapshot interval; default is 300 seconds.
-- `AI_DISCOVERY_ENABLED`: Enables AI Discovery.
-- `OLLAMA_BASE_URL` and `OLLAMA_MODEL`: Local Ollama URL and model. The example uses `http://localhost:11434` and `qwen3:8b`.
-- `HELIUS_API_KEYS`: Optional provider keys. Helius is not the source of market cap or liquidity in this app.
+Copy `.env.example` to `.env` and edit local settings there. Keep real credentials and machine-specific values out of Git.
 
-Keep actual credentials and machine-specific overrides in `.env`; do not commit them.
+- `DATABASE_URL` defaults to SQLite at `sqlite:///./app.db`.
+- `FOMO_ACTIVITY_MONITOR_ENABLED` controls browser-based Fomo Family monitoring.
+- `FOMO_ACTIVITY_BROWSER_PROFILE_DIR` selects the local browser profile directory.
+- `TOKEN_REFRESH_INTERVAL_SECONDS` controls market snapshot frequency.
+- `AI_DISCOVERY_ENABLED`, `OLLAMA_BASE_URL`, and `OLLAMA_MODEL` control AI Discovery.
+- `HELIUS_API_KEYS` is optional; Helius does not provide this app's market cap or liquidity data.
+
+For optional PostgreSQL and Redis containers, run `docker compose up -d postgres redis`. To use the Compose PostgreSQL service, set `DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/meme_intelligence` in `.env`. SQLite remains the simplest local setup.
+
+Set `PORT` to change the web port, for example `PORT=8001 python main.py`.
 
 ## Tests
-
-Activate the virtual environment, then run:
 
 ```bash
 python -m pytest -q
 ```
 
-## GitHub Hygiene
+## Before Pushing to GitHub
 
-`.gitignore` excludes `.env` files, SQLite/database files, virtual environments, Python caches, and the entire local `data/` directory (including browser profiles and follower state). `.env.example` is the safe configuration template to commit. If local data or credentials were committed previously, `.gitignore` alone will not remove them from Git history; untrack them and rotate any exposed credentials before pushing.
-=======
-# Fomo.family-Profile-Tracker
+`.gitignore` excludes `.env` files, local databases, virtual environments, caches, and the local `data/` directory. Commit `.env.example`, not `.env`. Ignore rules do not remove files already tracked by Git; if credentials were committed previously, remove them from the repository history and rotate them before publishing.
