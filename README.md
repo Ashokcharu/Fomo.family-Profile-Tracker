@@ -69,6 +69,3 @@ Set `PORT` to change the web port, for example `PORT=8001 python main.py`.
 python -m pytest -q
 ```
 
-## Before Pushing to GitHub
-
-`.gitignore` excludes `.env` files, local databases, virtual environments, caches, and the local `data/` directory. Commit `.env.example`, not `.env`. Ignore rules do not remove files already tracked by Git; if credentials were committed previously, remove them from the repository history and rotate them before publishing.
