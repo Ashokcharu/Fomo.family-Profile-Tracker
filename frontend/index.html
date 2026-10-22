@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#17251f" />
+    <title>FomoProfleTracker | Onchain intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <a class="brand" href="/" aria-label="FomoProfleTracker overview">
+                <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+                <span class="brand-copy"><strong>FomoProfle</strong><small>ONCHAIN INTELLIGENCE</small></span>
+            </a>
+
+            <nav class="primary-nav" id="primary-nav" aria-label="Workspace sections">
+                <div class="nav-group-label">MONITOR</div>
+                <button class="nav-item is-active" data-page="overview" aria-current="page"><span class="nav-symbol nav-symbol--pulse">↗</span><span>Overview</span><span class="nav-key" data-count="overview"></span></button>
+                <button class="nav-item" data-page="tokens"><span class="nav-symbol">◈</span><span>The Tokens</span><span class="nav-key" data-count="tokens"></span></button>
+                <button class="nav-item" data-page="followed"><span class="nav-symbol">◎</span><span>Traders</span><span class="nav-key" data-count="followed"></span></button>
+                <div class="nav-group-label nav-group-label--spaced">RESEARCH</div>
+                <button class="nav-item" data-page="favorites"><span class="nav-symbol">☆</span><span>Favorites</span><span class="nav-key" data-count="favorites"></span></button>
+                <button class="nav-item" data-page="graduated"><span class="nav-symbol">↗</span><span>Graduated</span><span class="nav-key" data-count="graduated"></span></button>
+                <button class="nav-item" data-page="risk"><span class="nav-symbol">△</span><span>Risk signals</span><span class="nav-key" data-count="risk"></span></button>
+                <button class="nav-item" data-page="ai"><span class="nav-symbol">✧</span><span>AI discovery</span><span class="nav-key" data-count="ai"></span></button>
+                <button class="nav-item" data-page="dismissed"><span class="nav-symbol">—</span><span>Dismissed</span><span class="nav-key" data-count="dismissed"></span></button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="connection-state"><span class="connection-dot"></span><span><strong id="connection-label">Connecting</strong><small>API connection</small></span></div>
+                <div class="sidebar-footer-line"><span>FOMO PROFILE TRACKER</span><span>v0.1</span></div>
+            </div>
+        </aside>
+
+        <div class="content-shell">
+            <header class="topbar">
+                <button class="mobile-menu" id="mobile-menu" aria-expanded="false" aria-controls="sidebar">Menu</button>
+                <div class="breadcrumbs"><span>FomoProfle</span><span class="breadcrumb-divider">/</span><strong id="breadcrumb-current">Overview</strong></div>
+                <div class="topbar-tools">
+                    <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh view" title="Refresh view"><span aria-hidden="true">↻</span></button>
+                    <button class="primary-button" id="primary-action" type="button"><span aria-hidden="true">+</span><span id="primary-action-label">Add token</span></button>
+                </div>
+            </header>
+
+            <main class="main-content">
+                <section class="page-heading">
+                    <div>
+                        <div class="eyebrow"><span class="eyebrow-mark"></span><span id="page-eyebrow">LIVE WORKSPACE</span></div>
+                        <h1 id="page-title">Market pulse</h1>
+                        <p id="page-description">A clear view of what is moving across your tracked chains.</p>
+                    </div>
+                    <div class="updated-label"><span class="updated-dot"></span><span id="updated-at">Waiting for first sync</span></div>
+                </section>
+
+                <section class="metric-grid" id="metric-grid" aria-label="Workspace metrics" aria-live="polite"></section>
+
+                <section class="data-section" aria-labelledby="table-title">
+                    <div class="section-heading">
+                        <div><div class="section-kicker" id="section-kicker">ACTIVITY</div><h2 id="table-title">Latest signals</h2></div>
+                        <div class="section-tools">
+                            <label class="search-box" id="search-control" for="view-search"><span class="search-symbol" aria-hidden="true">⌕</span><input id="view-search" type="search" placeholder="Search name, ticker, or contract" autocomplete="off" /><kbd>/</kbd></label>
+                            <label class="trader-sort-control" id="trader-sort-control" for="trader-sort" hidden>Sort
+                                <select id="trader-sort">
+                                    <option value="score">Score</option>
+                                    <option value="success_10x">10× rate</option>
+                                    <option value="median_growth">Median growth</option>
+                                    <option value="total_picks">Qualifying picks</option>
+                                </select>
+                            </label>
+                            <button class="primary-button" id="ai-run-button" type="button" hidden><span aria-hidden="true">✦</span><span>Analyze tracked tokens</span></button>
+                            <button class="text-button" id="delete-selected-tokens" type="button" hidden>Delete selected</button>
+                            <span class="result-count" id="result-count">Loading</span>
+                        </div>
+                    </div>
+                    <div class="table-frame" id="table-frame">
+                        <div class="table-scroll">
+                            <table>
+                                <thead id="table-head"></thead>
+                                <tbody id="table-body"></tbody>
+                            </table>
+                        </div>
+                        <div class="empty-state" id="empty-state" hidden>
+                            <span class="empty-mark" aria-hidden="true">◌</span>
+                            <h3 id="empty-title">Nothing here yet</h3>
+                            <p id="empty-description">New activity will appear here when it is available.</p>
+                        </div>
+                        <div class="error-state" id="error-state" hidden>
+                            <span class="error-mark" aria-hidden="true">!</span>
+                            <div><strong>Could not load this view</strong><p id="error-message">Check the API connection and try again.</p></div>
+                            <button class="text-button" id="retry-button" type="button">Retry</button>
+                        </div>
+                    </div>
+                    <div class="section-footer"><span id="table-footnote">Showing the latest records</span><span class="keyboard-note">Use search to filter visible rows</span><div class="pagination-controls" id="pagination-controls" aria-label="Table pagination" hidden></div></div>
+                </section>
+                <footer class="page-footer"><span>Market intelligence, without the noise.</span><span id="footer-clock"></span></footer>
+            </main>
+        </div>
+    </div>
+
+    <dialog class="entry-dialog" id="entry-dialog">
+        <form class="dialog-form" id="token-form" method="dialog" hidden>
+            <div class="dialog-topline"><span class="dialog-kicker">TRACKING</span><button class="dialog-close" type="button" data-close-dialog aria-label="Close dialog">×</button></div>
+            <h2>Track a token</h2>
+            <p class="dialog-copy">Add a contract to your monitored token list.</p>
+            <label class="field-label" for="token-chain">Chain</label>
+            <input class="field-input" id="token-chain" name="chain_name" list="chain-options" placeholder="solana" required />
+            <datalist id="chain-options"><option value="solana"><option value="ethereum"><option value="bnb"><option value="base"><option value="monad"><option value="robinhood"></datalist>
+            <label class="field-label" for="token-address">Contract address</label>
+            <input class="field-input" id="token-address" name="address" placeholder="Paste contract address" required />
+            <div class="dialog-actions"><button class="secondary-button" type="button" data-close-dialog>Cancel</button><button class="primary-button" type="submit">Add to tracking</button></div>
+        </form>
+        <form class="dialog-form" id="trader-form" method="dialog" hidden>
+            <div class="dialog-topline"><span class="dialog-kicker">TRADER TRACKING</span><button class="dialog-close" type="button" data-close-dialog aria-label="Close dialog">×</button></div>
+            <h2>Follow a trader</h2>
+            <p class="dialog-copy">Add a public username to your watchlist.</p>
+            <label class="field-label" for="trader-username">Username</label>
+            <input class="field-input" id="trader-username" name="username" placeholder="e.g. trader_handle" required />
+            <div class="dialog-actions"><button class="secondary-button" type="button" data-close-dialog>Cancel</button><button class="primary-button" type="submit">Add trader</button></div>
+        </form>
+    </dialog>
+    <dialog class="buyer-dialog" id="buyer-dialog" aria-labelledby="buyer-title">
+        <div class="dialog-form">
+            <div class="dialog-topline"><span class="dialog-kicker">FOLLOWED TRADERS</span><button class="dialog-close" type="button" data-close-buyers aria-label="Close buyer list">×</button></div>
+            <h2 id="buyer-title">Token buyers</h2>
+            <ul class="buyer-list" id="buyer-list"></ul>
+        </div>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
