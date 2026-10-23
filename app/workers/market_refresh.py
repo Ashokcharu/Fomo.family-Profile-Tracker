@@ -9,6 +9,7 @@ from sqlalchemy import func
 
 from app.config import get_settings
 from app.database import SessionLocal
+from app.database import SessionLocal
 from app.features.dismissed_tokens.service import active_dismissed_token_ids
 from app.features.graduated_tokens.service import record_graduation_progress
 from app.features.risk_analysis.service import record_rmc_drawdown_risk

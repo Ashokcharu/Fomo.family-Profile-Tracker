@@ -24,12 +24,14 @@ def build_candidate_features(token: dict, settings) -> dict:
     liquidity_score = min(25.0, liquidity / settings.minimum_liquidity_usd * 25) if liquidity is not None else 0.0
     buyer_score = min(25.0, buyers / 5 * 25)
     growth_score = min(15.0, max(0.0, 5 + math.log2(growth) * 5)) if growth is not None and growth > 0 else 0.0
+    early_momentum_score = min(10.0, max(0.0, (growth - 1) * 50)) if growth is not None and 1 < growth < 2 else 0.0
     holder_score = min(10.0, holders / 100 * 10) if token.get("fomo_holder_count") is not None else 0.0
     score_breakdown = {
         "market_cap_fit": round(market_cap_score, 1),
         "liquidity": round(liquidity_score, 1),
         "followed_buyers": round(buyer_score, 1),
         "observed_growth": round(growth_score, 1),
+        "early_momentum": round(early_momentum_score, 1),
         "holders": round(holder_score, 1),
     }
 
@@ -55,6 +57,8 @@ def build_candidate_features(token: dict, settings) -> dict:
         strengths.append("One followed trader has bought this token.")
     if growth is not None and growth >= 2:
         strengths.append(f"Observed growth is {growth:.2f}× from the tracked baseline.")
+    elif growth is not None and growth > 1:
+        strengths.append(f"Early positive movement is {growth:.2f}× from the tracked baseline.")
     elif growth is not None and growth < 1:
         risks.append("Current market cap is below its tracked baseline.")
     if token.get("fomo_holder_count") is None:
@@ -72,11 +76,13 @@ def build_candidate_features(token: dict, settings) -> dict:
         "contract_address": token.get("contract_address"),
         "fomo_url": token.get("fomo_url"),
         "market_cap": market_cap,
+        "reach_market_cap": _number(token.get("reach_market_cap")),
         "liquidity": liquidity,
         "buyer_count": buyers,
         "fomo_holder_count": holders if token.get("fomo_holder_count") is not None else None,
         "growth_multiple": growth,
         "growth_percent": _number(token.get("growth_percent")),
+        "reached_high_market_cap": _number(token.get("reached_high_market_cap")),
         "heuristic_score": round(sum(score_breakdown.values()), 1),
         "score_breakdown": score_breakdown,
         "strengths": strengths,

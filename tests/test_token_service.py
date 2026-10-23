@@ -12,7 +12,7 @@ from app.features.favorites.service import delete_favorites
 from app.features.risk_analysis.service import count_risk_findings, delete_risk_findings, list_risk_findings, record_rmc_drawdown_risk
 from app.features.dismissed_tokens.service import active_dismissed_token_ids, count_dismissed_tokens, delete_dismissed_tokens, dismiss_tokens, list_dismissed_tokens
 from app.features.graduated_tokens.service import count_graduated_tokens, list_graduated_tokens
-from app.features.tokens.service import active_token_count, delete_token, delete_tokens, list_recent_bought_tokens, list_tokens, list_token_buyers
+from app.features.tokens.service import active_token_count, delete_token, delete_tokens, list_active_token_ids, list_recent_bought_tokens, list_tokens, list_token_buyers
 from app.models import Chain, DismissedToken, Favorite, FollowedTrader, GraduationEvent, MarketObservation, RiskFinding, Token, TraderTransactionEvent
 
 
@@ -66,6 +66,33 @@ def test_tracked_tokens_excludes_tokens_in_other_active_lists() -> None:
         session.commit()
 
         assert {row["id"] for row in list_tokens(session)} == {tracked.id, restored.id}
+        assert list_active_token_ids(
+            session,
+            {tracked.id, favorited.id, graduated.id, risk_tagged.id, dismissed.id, restored.id},
+        ) == {tracked.id, restored.id}
+
+
+def test_active_token_id_lookup_preserves_duplicate_identity_rules() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        alias_chain = Chain(chain_name="Fomo Network 8453", chain_slug="fomo-network-8453", chain_id="8453")
+        session.add_all([chain, alias_chain])
+        session.flush()
+        first = Token(chain_id=chain.id, contract_address="same", normalized_address="same")
+        second = Token(chain_id=alias_chain.id, contract_address="same", normalized_address="same")
+        session.add(first)
+        session.flush()
+        session.add(second)
+        session.commit()
+
+        assert list_active_token_ids(session, {first.id}) == set()
+        assert list_active_token_ids(session, {first.id, second.id}) == {second.id}
+
+        session.add(Favorite(token_id=first.id))
+        session.commit()
+        assert list_active_token_ids(session, {first.id, second.id}) == set()
 
 
 def test_tracked_token_search_filters_before_pagination() -> None:

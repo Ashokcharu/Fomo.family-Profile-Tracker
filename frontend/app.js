@@ -6,7 +6,7 @@ const pageTotalKeys = {
     tokens: 'tokens', followed: 'followed_traders',
     favorites: 'favorites', graduated: 'graduations', risk: 'risk_findings', dismissed: 'dismissed_tokens',
 };
-const searchablePages = new Set(['tokens', 'followed', 'favorites', 'graduated', 'risk', 'dismissed']);
+const searchablePages = new Set(['tokens', 'followed', 'favorites', 'graduated', 'risk', 'dismissed', 'topPicks']);
 const searchCountEndpoints = {
     tokens: '/tokens/count', followed: '/followed-traders/count', favorites: '/favorites/count', graduated: '/graduated-tokens/count',
     risk: '/risk-analysis/count', dismissed: '/dismissed-tokens/count',
@@ -67,7 +67,15 @@ const pageDefinitions = {
         eyebrow: 'RESEARCH SYSTEMS', kicker: 'TRACKED TOKEN ANALYSIS', tableTitle: 'Tracked token candidates',
         endpoint: '/ai-discovery/', emptyTitle: 'No discovery results yet',
         emptyDescription: 'Run an analysis to rank active tokens from The Tokens.',
-        columns: ['aiRank', 'aiTokenIdentity', 'favorite', 'chain', 'aiRecommendation', 'aiScore', 'marketCap', 'liquidity', 'buyers', 'holders', 'aiSummary', 'aiStrengths', 'aiRisks'],
+        columns: ['aiRank', 'aiTokenIdentity', 'favorite', 'aiScore', 'aiGrowth', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiSummary', 'aiStrengths', 'aiRisks'],
+    },
+    topPicks: {
+        title: 'Top 3 picks', breadcrumb: 'Top 3 picks',
+        description: 'Active candidates that cleared both growth baselines and the confidence threshold.',
+        eyebrow: 'PINNED CANDIDATES', kicker: 'ACTIVE PICKS', tableTitle: 'Top 3 tracked tokens',
+        endpoint: '/ai-discovery/', emptyTitle: 'No eligible picks yet',
+        emptyDescription: 'Eligible tokens will appear here after an AI discovery scan.',
+        columns: ['aiRank', 'tokenIdentity', 'address', 'marketCap', 'topPickRmc', 'topPickHigh', 'topPickGrowthCurrent', 'topPickGrowthHigh', 'aiScore', 'topPickRemove'],
     },
     dismissed: {
         title: 'Dismissed tokens', breadcrumb: 'Dismissed',
@@ -130,6 +138,40 @@ const columnDefinitions = {
     aiTokenIdentity: { label: 'Token', value: (row) => row.name || row.ticker || 'Unknown token', action: 'aiTokenIdentity' },
     aiRecommendation: { label: 'Assessment', value: (row) => row.recommendation || 'Review' },
     aiScore: { label: 'Score', title: 'Combined tracked-signal and local-model score from 0 to 100', value: (row) => `${Number(row.score ?? 0).toFixed(1)} / 100` },
+    aiGrowth: { label: 'Growth', title: 'Current market cap divided by the original tracked RMC', value: (row) => row.growth_multiple === null || row.growth_multiple === undefined ? '—' : `${Number(row.growth_multiple).toFixed(2)}×` },
+    aiRmc: { label: 'AI RMC', title: 'AI discovery reached market-cap baseline', value: (row) => compactMoney(row.ai_rmc) },
+    aiHighest: { label: 'AIRH', title: 'Highest market cap observed since the AI RMC baseline', value: (row) => compactMoney(row.ai_rh) },
+    aiGrowthCurrent: {
+        label: 'AI RMC→MC',
+        title: 'Growth from AI discovery RMC to current market cap',
+        value: (row) => growthLabel(row.ai_rmc, row.market_cap),
+        growthPercent: (row) => growthPercent(row.ai_rmc, row.market_cap),
+        action: 'growth',
+    },
+    aiGrowthHigh: {
+        label: 'AI RMC→AIRH',
+        title: 'Growth from AI discovery RMC to the highest market cap observed since that baseline',
+        value: (row) => growthLabel(row.ai_rmc, row.ai_rh),
+        growthPercent: (row) => growthPercent(row.ai_rmc, row.ai_rh),
+        action: 'growth',
+    },
+    topPickRmc: { label: 'T RMC', title: 'Market cap when the token entered Top 3', value: (row) => compactMoney(row.t_rmc) },
+    topPickHigh: { label: 'TRH', title: 'Highest market cap observed since the token entered Top 3', value: (row) => compactMoney(row.t_rh) },
+    topPickGrowthCurrent: {
+        label: 'T RMC→MC',
+        title: 'Growth from Top 3 entry market cap to current market cap',
+        value: (row) => growthLabel(row.t_rmc, row.market_cap),
+        growthPercent: (row) => growthPercent(row.t_rmc, row.market_cap),
+        action: 'growth',
+    },
+    topPickGrowthHigh: {
+        label: 'T RMC→TRH',
+        title: 'Growth from Top 3 entry market cap to the highest market cap since entry',
+        value: (row) => growthLabel(row.t_rmc, row.t_rh),
+        growthPercent: (row) => growthPercent(row.t_rmc, row.t_rh),
+        action: 'growth',
+    },
+    topPickRemove: { label: 'Remove AI', title: 'Remove this token from Top 3 picks', value: () => '×', action: 'removeTopPick' },
     aiSummary: { label: 'Analysis', value: (row) => row.summary || 'No summary available' },
     aiStrengths: { label: 'Signals', value: (row) => row.strengths?.join(' · ') || '—' },
     aiRisks: { label: 'Risks', value: (row) => row.risks?.join(' · ') || '—' },
@@ -195,6 +237,7 @@ let activePage = 'overview';
 let activeRows = [];
 let toastTimer;
 let loadSequence = 0;
+let activePageLoads = 0;
 let searchTimer;
 let deleteRowsInProgress = false;
 let activeResultCount;
@@ -667,6 +710,16 @@ function renderTable(rows, keys) {
                     : deleteFavorite ? 'Remove from favorites' : deleteToken ? 'Delete token' : 'Delete followed profile';
                 button.setAttribute('aria-label', `${button.title}: ${button.dataset.rowName}`);
                 cell.append(button);
+            } else if (column.action === 'removeTopPick') {
+                const button = document.createElement('button');
+                button.className = 'table-action table-action--delete';
+                button.type = 'button';
+                button.dataset.action = 'remove-ai-pick';
+                button.dataset.tokenId = String(row.token_id);
+                button.title = column.title;
+                button.setAttribute('aria-label', `Remove ${row.ticker || row.name || `token #${row.token_id}`} from Top 3 picks`);
+                button.textContent = value;
+                cell.append(button);
             } else if (column.action === 'socials') {
                 const links = Array.isArray(value) ? value : [];
                 if (!links.length) cell.textContent = '—';
@@ -861,6 +914,7 @@ function setLoading() {
 async function loadPage(page = activePage, requestedPageIndex, searchQuery = page === activePage ? elements.search.value.trim() : '') {
     const definition = pageDefinitions[page];
     if (!definition) return;
+    activePageLoads += 1;
     const totalRecords = workspaceCounts[pageTotalKeys[page]];
     let pageIndex = requestedPageIndex ?? pageIndexes.get(page) ?? 0;
     if (page === 'overview') pageIndex = 0;
@@ -925,11 +979,11 @@ async function loadPage(page = activePage, requestedPageIndex, searchQuery = pag
             if (page === 'followed') pageParams.set('sort_by', traderSort);
             if (searchablePages.has(page) && searchQuery) pageParams.set('search', searchQuery);
             const [result, health, searchCount] = await Promise.all([
-                fetchJson(page === 'ai'
+                fetchJson(['ai', 'topPicks'].includes(page)
                     ? definition.endpoint
                     : `${definition.endpoint}?${pageParams}`),
                 page === 'followed' ? fetchJson('/health').catch(() => null) : Promise.resolve(null),
-                searchablePages.has(page) && searchQuery
+                searchablePages.has(page) && searchCountEndpoints[page] && searchQuery
                     ? fetchJson(`${searchCountEndpoints[page]}?search=${encodeURIComponent(searchQuery)}`)
                     : Promise.resolve(null),
             ]);
@@ -945,13 +999,24 @@ async function loadPage(page = activePage, requestedPageIndex, searchQuery = pag
                 elements.updated.textContent = `Checked ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
                 return;
             }
-            activeRows = Array.isArray(result) ? result : [];
-            activeResultCount = searchCount?.count;
-            pageMetrics = defaultMetrics(activeRows, page, activeResultCount);
-            setMetrics(pageMetrics);
+            if (page === 'topPicks') {
+                activeRows = (result.top_picks || []).map((pick, index) => ({ ...pick, rank: index + 1 }));
+                activeResultCount = activeRows.length;
+                pageMetrics = [
+                    { label: 'Active picks', value: String(activeRows.length), caption: 'Of 3 available slots' },
+                    { label: 'Eligibility', value: 'Both RMCs', caption: 'Growth above baselines, at or below 2×' },
+                    { label: 'Source', value: 'The Tokens', caption: 'Active tracked tokens only' },
+                ];
+                setMetrics(pageMetrics);
+            } else {
+                activeRows = Array.isArray(result) ? result : [];
+                activeResultCount = searchCount?.count;
+                pageMetrics = defaultMetrics(activeRows, page, activeResultCount);
+                setMetrics(pageMetrics);
+            }
         }
         if (requestSequence !== loadSequence || activePage !== page) return;
-        pageCache.set(pageCacheKey, { rows: activeRows, metrics: pageMetrics, totalCount: activeResultCount });
+        if (page !== 'topPicks') pageCache.set(pageCacheKey, { rows: activeRows, metrics: pageMetrics, totalCount: activeResultCount });
         setTableColumns(definition.columns);
         renderTable(activeRows, definition.columns);
         updateTableControls();
@@ -971,7 +1036,10 @@ async function loadPage(page = activePage, requestedPageIndex, searchQuery = pag
         elements.updated.textContent = 'Sync failed';
         if (page !== 'overview') setMetrics(defaultMetrics([], page));
     } finally {
-        if (requestSequence === loadSequence) elements.refresh.classList.remove('is-loading');
+        activePageLoads = Math.max(0, activePageLoads - 1);
+        if (requestSequence === loadSequence) {
+            elements.refresh.classList.remove('is-loading');
+        }
     }
 }
 
@@ -1034,6 +1102,34 @@ elements.tableBody.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-action]');
     if (!button) return;
     const tokenId = button.dataset.tokenId;
+    if (button.dataset.action === 'ai-feedback') {
+        button.disabled = true;
+        try {
+            await fetchJson(`/ai-discovery/feedback/${tokenId}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rating: button.dataset.rating }),
+            });
+            pageCache.delete(`ai::0:`);
+            showToast('Feedback saved and applied to future rankings.');
+            await loadPage('ai');
+        } catch (error) {
+            showToast(error instanceof Error ? error.message : 'Could not save feedback.', true);
+            button.disabled = false;
+        }
+        return;
+    }
+    if (button.dataset.action === 'remove-ai-pick') {
+        button.disabled = true;
+        try {
+            await fetchJson(`/ai-discovery/top-picks/${tokenId}`, { method: 'DELETE' });
+            showToast('Pick removed. The next eligible candidate now fills the slot.');
+            await loadPage('topPicks');
+        } catch (error) {
+            showToast(error instanceof Error ? error.message : 'Could not remove pick.', true);
+            button.disabled = false;
+        }
+        return;
+    }
     if (button.dataset.action === 'copy') {
         try {
             await copyText(button.dataset.copyValue);
@@ -1266,5 +1362,5 @@ function updateClock() {
 updateClock();
 loadPage();
 setInterval(() => {
-    if (document.visibilityState === 'visible') loadPage(activePage);
+    if (document.visibilityState === 'visible' && activePageLoads === 0) loadPage(activePage);
 }, 60_000);

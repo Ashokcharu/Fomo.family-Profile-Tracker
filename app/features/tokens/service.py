@@ -109,6 +109,64 @@ def list_all_active_tokens(db: Session) -> list[dict]:
     return _token_data_for_rows(db, _active_token_rows(db, limit=None))
 
 
+def list_active_token_ids(db: Session, token_ids: set[int]) -> set[int]:
+    if not token_ids:
+        return set()
+    requested_rows = (
+        db.query(Token.normalized_address)
+        .filter(Token.id.in_(token_ids))
+        .all()
+    )
+    addresses = {address.lower() for (address,) in requested_rows if address}
+    if not addresses:
+        return set()
+    rows = (
+        db.query(Token, Chain.chain_name, Chain.chain_id)
+        .join(Chain, Token.chain_id == Chain.id)
+        .filter(func.lower(Token.normalized_address).in_(addresses))
+        .order_by(Token.created_at.desc(), Token.id.desc())
+        .all()
+    )
+    row_ids = {token.id for token, _, _ in rows}
+    graduated_ids = {token.id for token, _, _ in rows if token.is_graduated}
+    favorite_ids = {
+        token_id for (token_id,) in db.query(Favorite.token_id)
+        .filter(Favorite.token_id.in_(row_ids))
+        .all()
+    }
+    risk_ids = {
+        token_id for (token_id,) in db.query(RiskFinding.token_id)
+        .filter(RiskFinding.token_id.in_(row_ids))
+        .distinct()
+        .all()
+    }
+    latest_dismissal_by_token: dict[int, bool] = {}
+    for token_id, restored in (
+        db.query(DismissedToken.token_id, DismissedToken.restored)
+        .filter(DismissedToken.token_id.in_(row_ids))
+        .order_by(DismissedToken.dismissed_at.desc(), DismissedToken.id.desc())
+        .all()
+    ):
+        latest_dismissal_by_token.setdefault(token_id, restored)
+    dismissed_ids = {
+        token_id for token_id, restored in latest_dismissal_by_token.items() if not restored
+    }
+    identities: dict[tuple[str, str], int] = {}
+    favorite_identities = set()
+    for token, chain_name, network_id in rows:
+        if token.id in graduated_ids or token.id in risk_ids or token.id in dismissed_ids:
+            continue
+        identity = (dexscreener_chain_name(chain_name, network_id), token.normalized_address.lower())
+        if token.id in favorite_ids:
+            favorite_identities.add(identity)
+        elif identity not in identities:
+            identities[identity] = token.id
+    return {
+        token_id for identity, token_id in identities.items()
+        if identity not in favorite_identities and token_id in token_ids
+    }
+
+
 def list_recent_bought_tokens(
     db: Session,
     limit: int = 50,

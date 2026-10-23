@@ -44,6 +44,10 @@ async def lifespan(app: FastAPI):
         _run_market_refresh(),
         name="market-data-refresh",
     )
+    ai_discovery_task = asyncio.create_task(
+        _run_ai_discovery(),
+        name="ai-discovery-refresh",
+    )
     monitor = None
     app.state.fomo_activity_monitor = None
     if settings.fomo_activity_monitor_enabled:
@@ -65,7 +69,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         market_refresh_task.cancel()
-        await asyncio.gather(market_refresh_task, return_exceptions=True)
+        ai_discovery_task.cancel()
+        await asyncio.gather(market_refresh_task, ai_discovery_task, return_exceptions=True)
         if monitor is not None:
             await monitor.stop()
 
@@ -74,6 +79,12 @@ async def _run_market_refresh() -> None:
     from app.workers.market_refresh import run_market_refresh
 
     await run_market_refresh(settings.token_refresh_interval_seconds, settings.dexscreener_api_url)
+
+
+async def _run_ai_discovery() -> None:
+    from app.workers.ai_discovery import run_ai_discovery
+
+    await run_ai_discovery(settings.ai_discovery_interval_seconds)
 
 
 app = FastAPI(

@@ -20,6 +20,7 @@ def test_settings_parse_helius_keys() -> None:
     settings = Settings(HELIUS_API_KEYS="key1,key2 , key3")
     assert settings.helius_keys == ["key1", "key2", "key3"]
     assert settings.token_refresh_interval_seconds == 300
+    assert settings.ai_discovery_interval_seconds == 600
 
 
 def test_registry_contains_supported_chains() -> None:

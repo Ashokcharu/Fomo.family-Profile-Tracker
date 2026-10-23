@@ -39,8 +39,10 @@ class Settings(BaseSettings):
     pagination_default_limit: int = 50
     pagination_max_limit: int = 200
     ai_discovery_enabled: bool = True
+    ai_discovery_interval_seconds: int = Field(default=600, ge=60)
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
+    ollama_num_threads: int = Field(default=2, ge=1, le=32)
 
     fomo_family_api_url: str = "https://api.fomo.family"
     fomo_activity_monitor_enabled: bool = False
