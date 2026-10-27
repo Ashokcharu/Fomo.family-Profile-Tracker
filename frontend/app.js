@@ -6,11 +6,12 @@ const pageTotalKeys = {
     tokens: 'tokens', followed: 'followed_traders',
     favorites: 'favorites', graduated: 'graduations', risk: 'risk_findings', dismissed: 'dismissed_tokens',
 };
-const searchablePages = new Set(['tokens', 'followed', 'favorites', 'graduated', 'risk', 'dismissed', 'topPicks']);
+const searchablePages = new Set(['tokens', 'followed', 'favorites', 'graduated', 'risk', 'dismissed', 'ai', 'analyzed', 'topPicks']);
 const searchCountEndpoints = {
     tokens: '/tokens/count', followed: '/followed-traders/count', favorites: '/favorites/count', graduated: '/graduated-tokens/count',
     risk: '/risk-analysis/count', dismissed: '/dismissed-tokens/count',
 };
+const aiAnalysisColumns = ['aiRank', 'aiTokenIdentity', 'aiDuration', 'favorite', 'aiScore', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiMore'];
 let followedMonitorStatus = { state: 'disabled', message: null };
 const pageDefinitions = {
     overview: {
@@ -67,7 +68,15 @@ const pageDefinitions = {
         eyebrow: 'RESEARCH SYSTEMS', kicker: 'TRACKED TOKEN ANALYSIS', tableTitle: 'Tracked token candidates',
         endpoint: '/ai-discovery/', emptyTitle: 'No discovery results yet',
         emptyDescription: 'Run an analysis to rank active tokens from The Tokens.',
-        columns: ['aiRank', 'aiTokenIdentity', 'favorite', 'aiScore', 'aiGrowth', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiSummary', 'aiStrengths', 'aiRisks'],
+        columns: [...aiAnalysisColumns, 'aiDelete'],
+    },
+    analyzed: {
+        title: 'AI Analyzed', breadcrumb: 'AI Analyzed',
+        description: 'Removed candidates with the same analysis columns as AI Discovery.',
+        eyebrow: 'RESEARCH HISTORY', kicker: 'REMOVED CANDIDATES', tableTitle: 'Analyzed tokens',
+        endpoint: '/ai-discovery/analyzed', emptyTitle: 'No analyzed tokens yet',
+        emptyDescription: 'Tokens removed from AI Discovery will appear here.',
+        columns: [...aiAnalysisColumns, 'aiAnalyzedAt'],
     },
     topPicks: {
         title: 'Top 3 picks', breadcrumb: 'Top 3 picks',
@@ -94,18 +103,27 @@ const columnDefinitions = {
     chain: { label: 'Chain', title: 'Blockchain network', value: (row) => chainLabel(row.chain_name) || (row.chain_id ? `Chain ${row.chain_id}` : '—'), icon: 'chain' },
     source: { label: 'Source', value: (row) => row.provider_name || row.source || '—' },
     confidence: { label: 'Confidence', value: (row) => percent(row.confidence), badge: true, tone: 'blue' },
-    marketCap: { label: 'MC', title: 'Market cap (MC)', value: (row) => compactMoney(row.market_cap ?? row.initial_market_cap ?? row.market_cap_at_favorite ?? row.market_cap_at_graduation) },
+    marketCap: {
+        label: 'MC',
+        title: 'Current market cap; unavailable when the latest quote is stale or unverified',
+        value: (row) => {
+            const warnings = row.market_data_warnings || [];
+            const unreliable = ['no_data', 'stale', 'low_liquidity', 'liquidity_unknown', 'market_cap_basis_unknown'];
+            if (row.market_cap !== null && row.market_cap !== undefined && warnings.some((warning) => unreliable.includes(warning))) return '—';
+            return compactMoney(row.market_cap ?? row.market_cap_at_favorite);
+        },
+    },
     marketUpdated: { label: 'Updated', title: 'Data updated', value: (row) => dateTime(row.observed_at) },
     price: { label: 'Price', value: (row) => money(row.price ?? row.price_at_favorite, true) },
-    liquidity: { label: 'Liq.', title: 'Liquidity', value: (row) => compactMoney(row.liquidity) },
-    holders: { label: 'FH', title: 'Fomo holders (FH)', value: (row) => row.fomo_holder_count === null || row.fomo_holder_count === undefined ? '—' : Number(row.fomo_holder_count).toLocaleString() },
+    liquidity: { label: 'Liq.', title: 'Liquidity', value: (row) => marketDataStale(row) ? '—' : compactMoney(row.liquidity) },
+    holders: { label: 'FH', title: 'Fomo holders (FH)', value: (row) => marketDataStale(row) || row.fomo_holder_count === null || row.fomo_holder_count === undefined ? '—' : Number(row.fomo_holder_count).toLocaleString() },
     reachMc: { label: 'RMC', title: 'Reached market cap (RMC)', value: (row) => compactMoney(row.reach_market_cap) },
     reachHigh: { label: 'RH', title: 'All-time high since tracking (RH)', value: (row) => compactMoney(row.reached_high_market_cap) },
     growthCurrent: {
         label: 'RMC→MC',
         title: 'Growth from reached market cap to current market cap',
-        value: (row) => growthLabel(row.reach_market_cap, row.market_cap),
-        growthPercent: (row) => growthPercent(row.reach_market_cap, row.market_cap),
+        value: (row) => marketDataUnreliable(row) ? '—' : growthLabel(row.reach_market_cap, row.market_cap),
+        growthPercent: (row) => marketDataUnreliable(row) ? null : growthPercent(row.reach_market_cap, row.market_cap),
         action: 'growth',
     },
     growthPeak: {
@@ -136,6 +154,13 @@ const columnDefinitions = {
     failureRate: { label: 'Failure', title: 'Failure proxy among picks observed at least 3 times across 7 days', value: (row) => performancePercent(row.failure_rate) },
     aiRank: { label: 'Rank', value: (row) => `#${row.rank}` },
     aiTokenIdentity: { label: 'Token', value: (row) => row.name || row.ticker || 'Unknown token', action: 'aiTokenIdentity' },
+    aiDuration: { label: 'HH', title: 'Hours since this token first entered AI Discovery', value: (row) => {
+        const hours = aiDurationHours(row.ai_discovery_since);
+        return hours === null ? '—' : `${String(Math.floor(hours)).padStart(2, '0')}h`;
+    } },
+    aiAnalyzedAt: { label: 'Removed', title: 'When this candidate was removed from AI Discovery', value: (row) => dateTime(row.ai_analyzed_at) },
+    aiMore: { label: 'Details', title: 'Open analysis, signals, and risks', value: () => 'More', action: 'aiDetails' },
+    aiDelete: { label: 'Remove', title: 'Remove this candidate from AI Discovery only', value: () => '×', action: 'removeAiCandidate' },
     aiRecommendation: { label: 'Assessment', value: (row) => row.recommendation || 'Review' },
     aiScore: { label: 'Score', title: 'Combined tracked-signal and local-model score from 0 to 100', value: (row) => `${Number(row.score ?? 0).toFixed(1)} / 100` },
     aiGrowth: { label: 'Growth', title: 'Current market cap divided by the original tracked RMC', value: (row) => row.growth_multiple === null || row.growth_multiple === undefined ? '—' : `${Number(row.growth_multiple).toFixed(2)}×` },
@@ -304,6 +329,17 @@ function growthPercent(baseline, value) {
     return percentChange * 100;
 }
 
+function marketDataUnreliable(row) {
+    const warnings = row.market_data_warnings || [];
+    return ['no_data', 'stale', 'low_liquidity', 'liquidity_unknown', 'market_cap_basis_unknown']
+        .some((warning) => warnings.includes(warning));
+}
+
+function marketDataStale(row) {
+    const warnings = row.market_data_warnings || [];
+    return warnings.includes('no_data') || warnings.includes('stale');
+}
+
 function growthLabel(baseline, value) {
     const percentChange = growthPercent(baseline, value);
     if (percentChange === null) return '—';
@@ -348,6 +384,11 @@ function dateTime(value) {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
     return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(date);
+}
+
+function aiDurationHours(value) {
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? Math.max(0, (Date.now() - timestamp) / 3_600_000) : null;
 }
 
 async function fetchJson(path, options = {}) {
@@ -525,6 +566,11 @@ function renderTable(rows, keys) {
     filteredRows.forEach((row, rowIndex) => {
         const tableRow = document.createElement('tr');
         tableRow.style.animationDelay = `${Math.min(rowIndex, 8) * 18}ms`;
+        if (activePage === 'ai') {
+            const hours = aiDurationHours(row.ai_discovery_since);
+            if (hours !== null && hours < 24) tableRow.classList.add('ai-candidate--new');
+            else if (hours !== null && hours >= 168) tableRow.classList.add('ai-candidate--long');
+        }
         keys.forEach((key) => {
             const column = columnDefinitions[key];
             if (!column) return;
@@ -720,6 +766,24 @@ function renderTable(rows, keys) {
                 button.setAttribute('aria-label', `Remove ${row.ticker || row.name || `token #${row.token_id}`} from Top 3 picks`);
                 button.textContent = value;
                 cell.append(button);
+            } else if (column.action === 'aiDetails') {
+                const button = document.createElement('button');
+                button.className = 'text-button ai-details-button';
+                button.type = 'button';
+                button.dataset.action = 'ai-details';
+                button.dataset.tokenId = String(row.token_id);
+                button.textContent = value;
+                cell.append(button);
+            } else if (column.action === 'removeAiCandidate') {
+                const button = document.createElement('button');
+                button.className = 'table-action table-action--delete';
+                button.type = 'button';
+                button.dataset.action = 'remove-ai-candidate';
+                button.dataset.tokenId = String(row.token_id);
+                button.title = column.title;
+                button.setAttribute('aria-label', `Remove ${row.ticker || row.name || `token #${row.token_id}`} from AI Discovery`);
+                button.textContent = value;
+                cell.append(button);
             } else if (column.action === 'socials') {
                 const links = Array.isArray(value) ? value : [];
                 if (!links.length) cell.textContent = '—';
@@ -758,6 +822,7 @@ function renderTable(rows, keys) {
                 const badge = document.createElement('span');
                 badge.className = `badge badge--${column.toneFrom ? column.toneFrom(row) : column.tone || 'blue'}`;
                 badge.textContent = value;
+                if (column.title) badge.title = typeof column.title === 'function' ? column.title(row) : column.title;
                 cell.append(badge);
             } else {
                 cell.textContent = value;
@@ -775,7 +840,9 @@ function renderTable(rows, keys) {
     const totalKey = pageTotalKeys[activePage];
     const totalRecords = activeResultCount ?? (totalKey ? workspaceCounts[totalKey] : undefined);
     const pageIndex = pageIndexes.get(activePage) || 0;
-    elements.count.textContent = activePage === 'overview'
+    elements.count.textContent = activePage === 'ai'
+        ? query ? `${filteredRows.length} of ${rows.length} candidates` : `${rows.length} candidates`
+        : activePage === 'overview'
         ? `Showing latest ${rows.length} bought tokens`
         : totalRecords !== undefined
         ? `Showing ${rows.length ? (pageIndex * pageSizeFor(activePage) + 1).toLocaleString() : 0}–${(pageIndex * pageSizeFor(activePage) + rows.length).toLocaleString()} of ${Number(totalRecords).toLocaleString()}`
@@ -809,7 +876,7 @@ function updateTableControls() {
         ? Math.max(1, pageIndex + (activeRows.length === currentPageSize ? 2 : 1))
         : Math.max(1, Math.ceil(Number(totalRecords) / currentPageSize));
     elements.pagination.replaceChildren();
-    elements.pagination.hidden = activePage === 'ai' || activePage === 'overview' || pageCount <= 1;
+    elements.pagination.hidden = ['ai', 'analyzed', 'overview'].includes(activePage) || pageCount <= 1;
     if (!elements.pagination.hidden) {
         const addButton = (label, targetPage, ariaLabel, current = false) => {
             const button = document.createElement('button');
@@ -859,11 +926,11 @@ function renderAiStatus(status) {
         : status.status === 'scanning' ? 'Scanning tracked tokens…'
             : 'Discovery queued…';
     const candidates = Array.isArray(status.candidates) ? status.candidates : [];
+    activeRows = candidates;
     elements.description.textContent = status.note || pageDefinitions.ai.description;
     elements.tableTitle.textContent = 'Tracked token candidates';
     setTableColumns(pageDefinitions.ai.columns);
     renderTable(candidates, pageDefinitions.ai.columns);
-    elements.count.textContent = `${Number(status.candidate_count || 0)} candidates`;
     elements.aiRunButton.disabled = !enabled || busy;
     elements.aiRunButton.textContent = busy ? progressLabel : enabled ? 'Analyze tracked tokens' : 'AI discovery disabled';
     setMetrics([
@@ -930,7 +997,8 @@ async function loadPage(page = activePage, requestedPageIndex, searchQuery = pag
     elements.error.hidden = true;
     elements.search.value = searchQuery;
     elements.searchControl.hidden = !searchablePages.has(page);
-    elements.search.placeholder = page === 'followed' ? 'Search username or profile ID' : 'Search name, ticker, or contract';
+    elements.search.placeholder = page === 'followed' ? 'Search username or profile ID'
+        : ['ai', 'analyzed'].includes(page) ? 'Search AI candidates' : 'Search name, ticker, or contract';
     elements.traderSortControl.hidden = page !== 'followed';
     elements.aiRunButton.hidden = page !== 'ai';
     elements.traderSort.value = traderSort;
@@ -1094,6 +1162,18 @@ function openEntryDialog() {
     elements.dialog.showModal();
 }
 
+function openAiDetails(candidate) {
+    const dialog = document.getElementById('ai-details-dialog');
+    document.getElementById('ai-details-title').textContent = candidate.name || candidate.ticker || 'AI candidate';
+    document.getElementById('ai-details-ticker').textContent = candidate.ticker || 'Ticker unavailable';
+    document.getElementById('ai-details-analysis').textContent = candidate.summary || 'No analysis available.';
+    document.getElementById('ai-details-signals').textContent = Array.isArray(candidate.strengths) && candidate.strengths.length
+        ? candidate.strengths.join(' · ') : 'No tracked signals listed.';
+    document.getElementById('ai-details-risks').textContent = Array.isArray(candidate.risks) && candidate.risks.length
+        ? candidate.risks.join(' · ') : 'No tracked risks listed.';
+    dialog.showModal();
+}
+
 elements.nav.addEventListener('click', (event) => {
     const button = event.target.closest('[data-page]');
     if (button) loadPage(button.dataset.page);
@@ -1126,6 +1206,26 @@ elements.tableBody.addEventListener('click', async (event) => {
             await loadPage('topPicks');
         } catch (error) {
             showToast(error instanceof Error ? error.message : 'Could not remove pick.', true);
+            button.disabled = false;
+        }
+        return;
+    }
+    if (button.dataset.action === 'ai-details') {
+        const candidate = activeRows.find((row) => String(row.token_id) === button.dataset.tokenId);
+        if (candidate) openAiDetails(candidate);
+        return;
+    }
+    if (button.dataset.action === 'remove-ai-candidate') {
+        const candidate = activeRows.find((row) => String(row.token_id) === tokenId);
+        const candidateName = candidate?.ticker || candidate?.name || `token #${tokenId}`;
+        if (!window.confirm(`Remove ${candidateName} from AI Discovery? The token and its history will remain tracked.`)) return;
+        button.disabled = true;
+        try {
+            await fetchJson(`/ai-discovery/candidates/${tokenId}`, { method: 'DELETE' });
+            showToast(`${candidateName} removed from AI Discovery.`);
+            await loadPage('ai');
+        } catch (error) {
+            showToast(error instanceof Error ? error.message : 'Could not remove AI candidate.', true);
             button.disabled = false;
         }
         return;
@@ -1263,10 +1363,10 @@ elements.tableHead.addEventListener('change', (event) => {
     updateTableControls();
 });
 elements.search.addEventListener('input', () => {
-    if (searchablePages.has(activePage)) {
+    if (searchablePages.has(activePage) && activePage !== 'ai') {
         clearTimeout(searchTimer);
         searchTimer = setTimeout(() => loadPage(activePage, 0, elements.search.value.trim()), 250);
-    } else if (activePage !== 'ai') {
+    } else {
         renderTable(activeRows, pageDefinitions[activePage].columns);
     }
 });
@@ -1302,6 +1402,7 @@ document.getElementById('retry-button').addEventListener('click', () => loadPage
 elements.primaryAction.addEventListener('click', openEntryDialog);
 document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => elements.dialog.close()));
 document.querySelector('[data-close-buyers]').addEventListener('click', () => document.getElementById('buyer-dialog').close());
+document.querySelector('[data-close-ai-details]').addEventListener('click', () => document.getElementById('ai-details-dialog').close());
 elements.dialog.addEventListener('click', (event) => {
     if (event.target === elements.dialog) elements.dialog.close();
 });

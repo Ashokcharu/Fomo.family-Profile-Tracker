@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -99,6 +99,28 @@ def test_dexscreener_batch_fetches_metrics_by_address(monkeypatch) -> None:
     assert metrics["token-address"]["market_cap"] == 12000
 
 
+def test_dexscreener_does_not_treat_fdv_as_market_cap(monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"pairs": [{
+                "chainId": "solana",
+                "baseToken": {"address": "token-address"},
+                "fdv": 110061,
+                "liquidity": {"usd": 175.19},
+            }]}
+
+    monkeypatch.setattr("app.integrations.dexscreener.client.httpx.get", lambda *args, **kwargs: Response())
+
+    metrics = DexScreenerClient().fetch_token_metrics("solana", "token-address")
+
+    assert metrics is not None
+    assert metrics["market_cap"] is None
+    assert metrics["fdv"] == 110061
+
+
 def test_graduation_preserves_original_discovery_snapshot() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -140,9 +162,13 @@ def test_market_refresh_graduates_once_and_updates_peak() -> None:
         session.flush()
 
         assert record_graduation_progress(session, token, 50000, 49999) is None
-        first_event = record_graduation_progress(session, token, 50000, 51000)
+        first_event = record_graduation_progress(
+            session, token, 50000, 51000, liquidity_usd=5000, minimum_liquidity_usd=5000
+        )
         session.flush()
-        second_event = record_graduation_progress(session, token, 50000, 72000)
+        second_event = record_graduation_progress(
+            session, token, 50000, 72000, liquidity_usd=5000, minimum_liquidity_usd=5000
+        )
         session.commit()
 
         assert first_event is second_event
@@ -154,6 +180,41 @@ def test_market_refresh_graduates_once_and_updates_peak() -> None:
 
         assert list_tokens(session) == []
         assert active_token_count(session) == 0
+
+
+def test_low_liquidity_cannot_create_or_update_graduation() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="solana", chain_slug="solana")
+        session.add(chain)
+        session.flush()
+        token = Token(chain_id=chain.id, contract_address="token", normalized_address="token")
+        session.add(token)
+        session.flush()
+
+        assert record_graduation_progress(
+            session,
+            token,
+            50000,
+            110061,
+            liquidity_usd=175.19,
+            minimum_liquidity_usd=5000,
+        ) is None
+        assert session.query(GraduationEvent).filter_by(token_id=token.id).count() == 0
+        assert token.is_graduated is False
+
+        existing_event = create_graduation(session, token, 50000, 51000)
+        assert record_graduation_progress(
+            session,
+            token,
+            50000,
+            110061,
+            existing_event=existing_event,
+            liquidity_usd=175.19,
+            minimum_liquidity_usd=5000,
+        ) is None
+        assert existing_event.highest_observed_market_cap == 51000
 
 
 def test_graduation_reconciliation_removes_only_ineligible_events() -> None:
@@ -316,6 +377,7 @@ def test_scheduled_refresh_persists_market_and_activity_snapshot(monkeypatch) ->
         assert snapshot.liquidity == 4500
         assert snapshot.raw_data["buyer_count"] == 1
         assert snapshot.raw_data["fomo_holder_count"] == 88
+        assert "pair" not in snapshot.raw_data
         second_trader = FollowedTrader(username="bob")
         session.add(second_trader)
         session.flush()
@@ -332,6 +394,51 @@ def test_scheduled_refresh_persists_market_and_activity_snapshot(monkeypatch) ->
         assert history[0]["liquidity"] == 4500
         assert history[0]["buyer_count"] == 1
         assert history[0]["fomo_holder_count"] == 88
+
+
+def test_market_observation_compaction_preserves_recent_first_and_peak_rows() -> None:
+    import app.workers.market_refresh as market_refresh
+    from app.models import MarketObservation
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime(2026, 10, 24, 12, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        chain = Chain(chain_name="solana", chain_slug="solana")
+        session.add(chain)
+        session.flush()
+        token = Token(chain_id=chain.id, contract_address="token", normalized_address="token")
+        session.add(token)
+        session.flush()
+        observations = [
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=datetime(2026, 1, 1), market_cap=50),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=datetime(2026, 1, 2), market_cap=80),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=datetime(2026, 1, 3), market_cap=900),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=datetime(2026, 10, 10, 8), market_cap=100),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=datetime(2026, 10, 10, 8, 15), market_cap=500),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=datetime(2026, 10, 10, 8, 30), market_cap=200),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=now - timedelta(hours=2), market_cap=300),
+            MarketObservation(token_id=token.id, source="scheduled_refresh", observed_at=now - timedelta(hours=1), market_cap=250),
+            MarketObservation(token_id=token.id, source="fomo_family_metadata", observed_at=datetime(2026, 1, 2), market_cap=99, raw_data={"fomo_holder_count": 20}),
+            MarketObservation(token_id=token.id, source="fomo_family_metadata", observed_at=datetime(2026, 10, 10, 8, 5), market_cap=100, raw_data={"fomo_holder_count": 22}),
+            MarketObservation(token_id=token.id, source="fomo_family_metadata", observed_at=datetime(2026, 10, 10, 8, 20), market_cap=120, raw_data={"fomo_holder_count": 23}),
+        ]
+        session.add_all(observations)
+        session.commit()
+
+        removed = market_refresh.compact_market_observations(session, now=now)
+
+        scheduled = session.query(MarketObservation).filter_by(
+            token_id=token.id,
+            source="scheduled_refresh",
+        ).order_by(MarketObservation.observed_at).all()
+        assert removed == 4
+        assert [row.market_cap for row in scheduled] == [50, 900, 500, 200, 300, 250]
+        fomo_rows = session.query(MarketObservation).filter_by(
+            token_id=token.id,
+            source="fomo_family_metadata",
+        ).all()
+        assert [row.market_cap for row in fomo_rows] == [120]
 
 
 def test_scheduled_refresh_falls_back_for_tokens_missing_from_batch(monkeypatch) -> None:

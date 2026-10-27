@@ -29,6 +29,7 @@
                 <button class="nav-item" data-page="graduated"><span class="nav-symbol">↗</span><span>Graduated</span><span class="nav-key" data-count="graduated"></span></button>
                 <button class="nav-item" data-page="risk"><span class="nav-symbol">△</span><span>Risk signals</span><span class="nav-key" data-count="risk"></span></button>
                 <button class="nav-item" data-page="ai"><span class="nav-symbol">✧</span><span>AI discovery</span><span class="nav-key" data-count="ai"></span></button>
+                <button class="nav-item" data-page="analyzed"><span class="nav-symbol">✓</span><span>AI Analyzed</span></button>
                 <button class="nav-item" data-page="topPicks"><span class="nav-symbol">★</span><span>Top 3 picks</span></button>
                 <button class="nav-item" data-page="dismissed"><span class="nav-symbol">—</span><span>Dismissed</span><span class="nav-key" data-count="dismissed"></span></button>
             </nav>
@@ -130,6 +131,16 @@
             <div class="dialog-topline"><span class="dialog-kicker">FOLLOWED TRADERS</span><button class="dialog-close" type="button" data-close-buyers aria-label="Close buyer list">×</button></div>
             <h2 id="buyer-title">Token buyers</h2>
             <ul class="buyer-list" id="buyer-list"></ul>
+        </div>
+    </dialog>
+    <dialog class="ai-details-dialog" id="ai-details-dialog" aria-labelledby="ai-details-title">
+        <div class="dialog-form">
+            <div class="dialog-topline"><span class="dialog-kicker">AI DISCOVERY</span><button class="dialog-close" type="button" data-close-ai-details aria-label="Close candidate details">×</button></div>
+            <h2 id="ai-details-title">AI candidate</h2>
+            <p class="ai-details-ticker" id="ai-details-ticker"></p>
+            <section class="ai-detail-section"><h3>Analysis</h3><p id="ai-details-analysis"></p></section>
+            <section class="ai-detail-section"><h3>Signals</h3><p id="ai-details-signals"></p></section>
+            <section class="ai-detail-section"><h3>Risks</h3><p id="ai-details-risks"></p></section>
         </div>
     </dialog>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>

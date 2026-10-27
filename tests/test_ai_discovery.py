@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.database import Base
 from app.features.ai_discovery.candidate_features import build_candidate_features
+from app.features.ai_discovery import service as ai_discovery_service
 from app.features.ai_discovery.service import AIDataService
 from app.integrations.ollama.client import OllamaClient
 from app.models import AIIntelligenceRecord, BackgroundJob, Chain, DismissedToken, Favorite, FollowedTrader, MarketObservation, Token, TraderTransactionEvent
@@ -148,6 +149,7 @@ def test_discovery_defers_and_persists_qwen_assessment() -> None:
         assert completed["status"] == "model_assisted"
         assert completed["candidates"][0]["model_score"] == 80
         assert completed["candidates"][0]["model_pending"] is False
+        assert datetime.fromisoformat(completed["candidates"][0]["ai_discovery_since"]).tzinfo == timezone.utc
         db.add(Favorite(token_id=token.id))
         db.commit()
         assert service.get_status(db)["candidates"][0]["is_favorite"] is True
@@ -190,6 +192,132 @@ def test_queued_discovery_worker_completes_with_tracked_signal_results() -> None
         assert completed["status"] == "heuristic_fallback"
         assert completed["tokens_scanned"] == 1
         assert completed["candidate_count"] == 1
+
+
+def test_removed_candidate_stays_tracked_but_is_excluded_from_future_ai_runs() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="active", normalized_address="active")
+        db.add(token)
+        db.flush()
+        db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        db.commit()
+
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        service.run_discovery(db, use_model=False)
+        assert service.get_status(db)["candidate_count"] == 1
+
+        assert service.remove_candidate(db, token.id) is True
+        assert service.get_status(db)["candidate_count"] == 0
+        analyzed = service.list_analyzed_candidates(db)
+        assert len(analyzed) == 1
+        assert analyzed[0]["token_id"] == token.id
+        assert analyzed[0]["score"] is not None
+        assert analyzed[0]["ai_analyzed_at"] is not None
+        assert analyzed[0]["archive_reason"] == "manually_removed"
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            observed_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            market_cap=30_000,
+            liquidity=12_000,
+        ))
+        db.commit()
+        refreshed_analyzed = service.list_analyzed_candidates(db)[0]
+        assert refreshed_analyzed["market_cap"] == 30_000
+        assert refreshed_analyzed["liquidity"] == 12_000
+        assert refreshed_analyzed["ai_rh"] == 30_000
+        service.run_discovery(db, use_model=False)
+
+        assert service.get_status(db)["candidate_count"] == 0
+        assert service.list_analyzed_candidates(db)[0]["token_id"] == token.id
+        assert db.get(Token, token.id) is not None
+
+
+def test_candidate_replaced_by_a_better_ranked_token_is_archived(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        tokens = [
+            Token(chain_id=chain.id, contract_address=f"token-{index}", normalized_address=f"token-{index}")
+            for index in range(50)
+        ]
+        db.add_all(tokens)
+        db.flush()
+        db.add_all([
+            MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000)
+            for token in tokens
+        ])
+        db.commit()
+
+        original_builder = ai_discovery_service.build_candidate_features
+        replacement_id = None
+
+        def score_new_token_higher(token_data, settings):
+            features = original_builder(token_data, settings)
+            features["heuristic_score"] = 90 if token_data["id"] == replacement_id else 60
+            return features
+
+        monkeypatch.setattr(ai_discovery_service, "build_candidate_features", score_new_token_higher)
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        first_run = service.run_discovery(db, use_model=False)
+        assert len(first_run["candidates"]) == 50
+
+        replacement = Token(chain_id=chain.id, contract_address="replacement", normalized_address="replacement")
+        db.add(replacement)
+        db.flush()
+        replacement_id = replacement.id
+        db.add(MarketObservation(token_id=replacement.id, source="test", market_cap=20_000, liquidity=10_000))
+        db.commit()
+
+        second_run = service.run_discovery(db, use_model=False)
+        assert replacement.id in {candidate["token_id"] for candidate in second_run["candidates"]}
+        assert tokens[0].id not in {candidate["token_id"] for candidate in second_run["candidates"]}
+        analyzed = service.list_analyzed_candidates(db)
+        replaced = next(candidate for candidate in analyzed if candidate["token_id"] == tokens[0].id)
+        assert replaced["archive_reason"] == "replaced_by_better_candidates"
+        assert replaced["score"] is not None
+
+
+def test_low_signal_candidate_is_archived_as_failed(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="low-signal", normalized_address="low-signal")
+        db.add(token)
+        db.flush()
+        db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        db.commit()
+
+        original_builder = ai_discovery_service.build_candidate_features
+
+        def score_candidate_low(token_data, settings):
+            features = original_builder(token_data, settings)
+            features["heuristic_score"] = 40
+            return features
+
+        monkeypatch.setattr(ai_discovery_service, "build_candidate_features", score_candidate_low)
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        first_result = service.run_discovery(db, use_model=False)
+        assert len(first_result["candidates"]) == 1
+
+        result = service.run_discovery(db, use_model=False)
+
+        assert result["candidates"] == []
+        analyzed = service.list_analyzed_candidates(db)
+        assert len(analyzed) == 1
+        assert analyzed[0]["token_id"] == token.id
+        assert analyzed[0]["archive_reason"] == "failed_low_signal"
 
 
 def test_early_positive_movement_gets_a_bounded_momentum_signal() -> None:

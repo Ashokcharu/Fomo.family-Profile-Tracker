@@ -11,8 +11,17 @@ from sqlalchemy.orm import Session
 from app.models import DiscoveryEvent, DismissedToken, GraduationEvent, MarketObservation, RiskFinding, Token
 
 
-def should_graduate(current_market_cap: float | None, threshold_usd: float) -> bool:
+def should_graduate(
+    current_market_cap: float | None,
+    threshold_usd: float,
+    liquidity_usd: float | None = None,
+    minimum_liquidity_usd: float = 0.0,
+) -> bool:
     if current_market_cap is None:
+        return False
+    if minimum_liquidity_usd > 0 and (
+        liquidity_usd is None or liquidity_usd < minimum_liquidity_usd
+    ):
         return False
     return current_market_cap >= threshold_usd
 
@@ -166,8 +175,21 @@ def record_graduation_progress(
     market_cap: float | None,
     observed_at: datetime | None = None,
     existing_event: GraduationEvent | None = None,
+    liquidity_usd: float | None = None,
+    minimum_liquidity_usd: float = 0.0,
 ) -> GraduationEvent | None:
+    if not should_graduate(
+        market_cap,
+        threshold_usd,
+        liquidity_usd,
+        minimum_liquidity_usd,
+    ) and existing_event is None:
+        return None
     if market_cap is None:
+        return None
+    if minimum_liquidity_usd > 0 and (
+        liquidity_usd is None or liquidity_usd < minimum_liquidity_usd
+    ):
         return None
 
     event = existing_event
@@ -179,8 +201,6 @@ def record_graduation_progress(
             .first()
         )
     if event is None:
-        if not should_graduate(market_cap, threshold_usd):
-            return None
         graduated_at = observed_at or datetime.now(timezone.utc)
         event = GraduationEvent(
             token_id=token.id,

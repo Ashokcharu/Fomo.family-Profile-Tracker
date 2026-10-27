@@ -268,7 +268,7 @@ def _swap_market_cap(swap: dict[str, Any], display: dict[str, Any]) -> float | N
         if isinstance(value, dict)
     )
     for source in sources:
-        for key in ("marketCapUsd", "market_cap_usd", "marketCap", "market_cap", "fdv"):
+        for key in ("marketCapUsd", "market_cap_usd", "marketCap", "market_cap"):
             if source.get(key) is not None:
                 return _as_float(source[key])
     return None

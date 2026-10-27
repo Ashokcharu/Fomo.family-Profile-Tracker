@@ -16,6 +16,11 @@ def get_ai_status(db: Session = Depends(get_db)) -> dict:
     return service.get_status(db)
 
 
+@router.get("/analyzed")
+def get_analyzed_candidates(db: Session = Depends(get_db)) -> list[dict]:
+    return service.list_analyzed_candidates(db)
+
+
 @router.post("/run")
 def run_ai_discovery(background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> dict:
     result = service.queue_discovery(db)
@@ -35,4 +40,10 @@ def rate_ai_candidate(token_id: int, feedback: DiscoveryFeedback, db: Session = 
 def remove_ai_top_pick(token_id: int, db: Session = Depends(get_db)) -> dict:
     if not service.remove_top_pick(db, token_id):
         raise HTTPException(status_code=404, detail="Active Top 3 pick not found")
+    return {"token_id": token_id, "removed": True}
+
+@router.delete("/candidates/{token_id}")
+def remove_ai_candidate(token_id: int, db: Session = Depends(get_db)) -> dict:
+    if not service.remove_candidate(db, token_id):
+        raise HTTPException(status_code=404, detail="Token not found")
     return {"token_id": token_id, "removed": True}

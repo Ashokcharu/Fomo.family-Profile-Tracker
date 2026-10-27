@@ -91,7 +91,8 @@ class DexScreenerClient:
         volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
         base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
         return {
-            "market_cap": pair.get("marketCap") or pair.get("fdv"),
+            "market_cap": pair.get("marketCap"),
+            "fdv": pair.get("fdv"),
             "price": pair.get("priceUsd"),
             "liquidity": liquidity.get("usd"),
             "volume": volume.get("h24"),

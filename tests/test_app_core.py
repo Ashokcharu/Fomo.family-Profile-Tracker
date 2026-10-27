@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,38 @@ def test_settings_parse_helius_keys() -> None:
     assert settings.helius_keys == ["key1", "key2", "key3"]
     assert settings.token_refresh_interval_seconds == 300
     assert settings.ai_discovery_interval_seconds == 600
+
+
+def test_file_logging_persists_messages_to_rotating_log(tmp_path: Path) -> None:
+    from app.logging_config import configure_file_logging
+    from logging.handlers import RotatingFileHandler
+
+    log_path = tmp_path / "app.log"
+    root_logger = logging.getLogger()
+    server_loggers = [logging.getLogger(name) for name in ("uvicorn.error", "uvicorn.access")]
+    prior_root_handlers = list(root_logger.handlers)
+    prior_server_handlers = [list(logger.handlers) for logger in server_loggers]
+    prior_propagate = [logger.propagate for logger in server_loggers]
+    try:
+        configure_file_logging("INFO", log_path)
+        logging.getLogger("test.persistent").warning("persistent diagnostic marker")
+        logging.getLogger("uvicorn.error").error("server diagnostic marker")
+        for handler in root_logger.handlers:
+            if isinstance(handler, RotatingFileHandler) and Path(handler.baseFilename) == log_path:
+                handler.flush()
+        contents = log_path.read_text(encoding="utf-8")
+        assert "persistent diagnostic marker" in contents
+        assert "server diagnostic marker" in contents
+    finally:
+        current_handlers = root_logger.handlers + [handler for logger in server_loggers for handler in logger.handlers]
+        prior_handlers = prior_root_handlers + [handler for handlers in prior_server_handlers for handler in handlers]
+        for handler in set(current_handlers) - set(prior_handlers):
+            root_logger.removeHandler(handler)
+            for logger in server_loggers:
+                logger.removeHandler(handler)
+            handler.close()
+        for logger, propagate in zip(server_loggers, prior_propagate):
+            logger.propagate = propagate
 
 
 def test_registry_contains_supported_chains() -> None:

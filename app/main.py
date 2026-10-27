@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
+from app.logging_config import configure_file_logging
 from app.schemas.system import ConfigResponse
 from app.database import Base, SessionLocal, engine
 from app.features.dashboard.routes import router as dashboard_router
@@ -27,12 +29,22 @@ from app.features.tokens.routes import router as tokens_router
 from app.models import MarketObservation
 
 settings = get_settings()
+LOG_FILE = configure_file_logging(settings.log_level)
+logger = logging.getLogger(__name__)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Application startup; persistent log file: %s", LOG_FILE)
     Base.metadata.create_all(bind=engine)
+    from app.workers.market_refresh import compact_market_history
+
+    try:
+        removed = await asyncio.to_thread(compact_market_history)
+        logger.info("Compacted market history before startup reconciliation; removed %d snapshots", removed)
+    except Exception:
+        logger.exception("Startup market history compaction failed")
     with SessionLocal() as db:
         reconcile_graduation_eligibility(db, settings.graduation_threshold_usd)
         backfill_trader_token_picks(db)
@@ -68,6 +80,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        logger.info("Application shutdown requested")
         market_refresh_task.cancel()
         ai_discovery_task.cancel()
         await asyncio.gather(market_refresh_task, ai_discovery_task, return_exceptions=True)

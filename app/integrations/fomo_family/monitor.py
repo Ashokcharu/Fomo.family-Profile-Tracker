@@ -446,7 +446,7 @@ class FomoFamilyActivityMonitor:
                         if isinstance((nested := source.get(key)), dict)
                     )
                 for field, keys in {
-                    "market_cap": ("marketCapUsd", "market_cap_usd", "marketCap", "market_cap", "fdv"),
+                    "market_cap": ("marketCapUsd", "market_cap_usd", "marketCap", "market_cap"),
                     "price": ("priceUsd", "price_usd", "usdPrice", "price"),
                     "liquidity": ("liquidityUsd", "liquidity_usd", "liquidity"),
                     "volume": ("volume24hUsd", "volume_24h_usd", "volume24h", "volume_24h", "volume"),

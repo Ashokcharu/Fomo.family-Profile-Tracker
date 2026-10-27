@@ -138,6 +138,10 @@ th[data-column="address"], td[data-column="address"] { width: 96px; max-width: 9
 td { height: 51px; max-width: 320px; padding: 8px 15px; border-bottom: 1px solid #edf0ed; color: #35423a; font-size: 11px; vertical-align: middle; }
 tbody tr { animation: row-in .22s ease both; }
 tbody tr:hover { background: #fafcf9; }
+tbody tr.ai-candidate--new > td { background: #edf7ef; }
+tbody tr.ai-candidate--new:hover > td { background: #e3f0e5; }
+tbody tr.ai-candidate--long > td { background: #fff2e6; }
+tbody tr.ai-candidate--long:hover > td { background: #fbe8d5; }
 tbody tr:last-child td { border-bottom: 0; }
 .cell-primary { color: #27362d; font-weight: 600; }
 .cell-muted { color: #869188; }
@@ -212,8 +216,15 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .entry-dialog { width: min(430px, calc(100% - 28px)); padding: 0; border: 1px solid #dfe7df; border-radius: 8px; color: var(--ink); background: white; box-shadow: 0 24px 70px rgba(15, 36, 26, .2); }
 .buyer-dialog { width: min(430px, calc(100% - 28px)); max-height: min(600px, calc(100% - 28px)); padding: 0; border: 1px solid #dfe7df; border-radius: 8px; color: var(--ink); background: white; box-shadow: 0 24px 70px rgba(15, 36, 26, .2); }
+.ai-details-dialog { width: min(520px, calc(100% - 28px)); max-height: min(720px, calc(100% - 28px)); overflow: auto; padding: 0; border: 1px solid #dfe7df; border-radius: 8px; color: var(--ink); background: white; box-shadow: 0 24px 70px rgba(15, 36, 26, .2); }
 .buyer-dialog::backdrop { background: rgba(13, 27, 19, .44); backdrop-filter: blur(2px); }
+.ai-details-dialog::backdrop { background: rgba(13, 27, 19, .44); backdrop-filter: blur(2px); }
 .buyer-dialog h2 { margin: 17px 0 13px; font-family: 'Space Grotesk', 'Segoe UI', sans-serif; font-size: 19px; }
+.ai-details-dialog h2 { margin: 17px 0 3px; font-family: 'Space Grotesk', 'Segoe UI', sans-serif; font-size: 19px; }
+.ai-details-ticker { margin: 0 0 17px; color: #7e8981; font-size: 11px; }
+.ai-detail-section { padding: 12px 0; border-top: 1px solid #edf0ed; }
+.ai-detail-section h3 { margin: 0 0 6px; color: #56635a; font-size: 10px; text-transform: uppercase; }
+.ai-detail-section p { margin: 0; color: #35423a; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .buyer-list { display: grid; gap: 0; max-height: 390px; overflow: auto; margin: 0; padding: 0; list-style: none; }
 .buyer-list li { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 0; border-top: 1px solid #edf0ed; font-size: 11px; }
 .buyer-list li span { color: #87938a; font-size: 10px; text-align: right; }

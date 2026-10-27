@@ -230,12 +230,39 @@ def test_token_rows_include_metrics_buyers_and_favorite_hides_them() -> None:
         assert graduated_row["fomo_holder_count"] == 58
         assert graduated_row["buyer_count"] == 1
         assert graduated_row["is_favorite"] is True
+        assert "low_liquidity" in graduated_row["market_data_warnings"]
+        assert "market_cap_basis_unknown" in graduated_row["market_data_warnings"]
 
         assert list_tokens(session) == []
         assert session.query(Favorite).count() == 1
         assert delete_favorite(session, favorite_row["id"]) is True
         assert list_favorites(session) == []
         assert delete_favorite(session, favorite_row["id"]) is False
+
+
+def test_token_rows_flag_stale_observations() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="Solana", chain_slug="solana")
+        session.add(chain)
+        session.commit()
+        token = create_or_get_token(session, "solana", "stale-token", chain_id=chain.id)
+        session.add(MarketObservation(
+            token_id=token.id,
+            source="dexscreener",
+            market_cap=110061,
+            liquidity=175.19,
+            observed_at=datetime(2020, 1, 1),
+            raw_data={},
+        ))
+        session.commit()
+
+        row = list_tokens(session)[0]
+
+        assert "stale" in row["market_data_warnings"]
+        assert "low_liquidity" in row["market_data_warnings"]
+        assert "market_cap_basis_unknown" in row["market_data_warnings"]
 
 
 def test_recent_bought_tokens_are_unique_and_sorted_by_latest_buy() -> None:

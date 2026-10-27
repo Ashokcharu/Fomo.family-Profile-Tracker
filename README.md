@@ -185,6 +185,7 @@ Tabs are frontend views over API responses; most tabs do not scrape data when op
 | **Graduated** | `GET /api/v1/graduated-tokens/` | Tracked tokens whose observed market cap crossed the configured threshold, with milestone and high values. |
 | **Risk signals** | `GET /api/v1/risk-analysis/` | Persisted findings such as a severe decline from the tracked market-cap baseline. This is rule-based evidence, not a full contract audit. |
 | **AI Discovery** | `GET /api/v1/ai-discovery/`; run with `POST /api/v1/ai-discovery/run` | Ranked active tracked tokens, score breakdown, feedback, model status, strengths, and risks. Opening the tab reads current results; the button queues a scan. |
+| **AI Analyzed** | `GET /api/v1/ai-discovery/analyzed` | Candidates manually removed, displaced from the top 50 by higher-ranked tokens, remaining below the existing 50-point Low signal threshold on a later scan, or no longer eligible. Their saved analysis and current market data remain available; tokens stay tracked. |
 | **Top 3 picks** | `GET /api/v1/ai-discovery/` | The active, eligible subset of AI candidates. Removing a pick does not delete its token. |
 | **Dismissed** | `GET /api/v1/dismissed-tokens/` | Historical dismissal records and reasons. Active dismissals are excluded from active review/refresh until restored through the relevant action. |
 
@@ -428,3 +429,13 @@ python -m pytest tests/test_root_ui.py -q
 - Risk findings are narrow rules (including observed market-cap drawdown), not a smart-contract audit or fraud verdict.
 - AI scores and trader performance are research summaries based on available observations. They are not financial advice, price predictions, realized returns, or guarantees of future results.
 - The dashboard has no user authentication configured. Do not expose it to an untrusted network without adding access control and reviewing deployment security.
+
+## License & Copyright
+
+Copyright © 2026 Ashok. All rights reserved.
+
+This project is publicly available for viewing and educational evaluation only. No permission is granted to copy, modify, redistribute, or commercially use this project's source code without prior written permission from the copyright holder.
+
+For commercial licensing or other usage permissions, please contact the author.
+
+**Note:** Public visibility does not grant general permission to reuse this code. Third-party components remain subject to their respective licenses.

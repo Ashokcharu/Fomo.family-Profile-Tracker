@@ -71,6 +71,23 @@ def test_fomo_token_metadata_extracts_optional_quote_values() -> None:
     }
 
 
+def test_fomo_token_metadata_does_not_treat_fdv_as_market_cap() -> None:
+    class MetadataPage:
+        async def evaluate(self, _script, _token_ids):
+            return [{
+                "address": "fdv-only-token",
+                "networkId": 8453,
+                "token": {"info": {"marketData": {"fdv": "900000"}}},
+            }]
+
+    monitor = fomo_monitor.FomoFamilyActivityMonitor()
+    monitor._page = MetadataPage()
+
+    _, metadata = asyncio.run(monitor._fetch_token_supplies([], ["fdv-only-token:8453"]))
+
+    assert metadata[("8453", "fdv-only-token")] == {}
+
+
 def test_fomo_token_metadata_requests_are_batched(monkeypatch) -> None:
     class MetadataPage:
         def __init__(self):
@@ -442,9 +459,25 @@ def test_fomo_swap_parser_keeps_only_identifiable_buys() -> None:
     assert parsed["network_id"] == "8453"
     assert parsed["token_amount"] == 42.5
     assert parsed["estimated_usd"] == 12.75
+    assert parsed["market_cap"] is None
     assert parsed["event_time"].isoformat() == "2026-10-18T10:47:10+00:00"
     assert parse_buy_swap({**swap, "display": {"side": "sell"}}) is None
     assert parse_buy_swap({**swap, "id": None}) is None
+
+
+def test_fomo_swap_parser_does_not_treat_fdv_as_market_cap() -> None:
+    swap = {
+        "id": "swap-fdv",
+        "display": {"side": "buy", "fdv": "900000"},
+        "outTokenAddress": "fdv-only-token",
+        "outNetworkId": 8453,
+        "createdAt": "2026-10-18T10:47:10.000Z",
+    }
+
+    parsed = parse_buy_swap(swap)
+
+    assert parsed is not None
+    assert parsed["market_cap"] is None
 
 
 def test_fomo_buy_persistence_deduplicates_by_provider_swap_id() -> None:

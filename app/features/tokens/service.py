@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.chains import chain_registry
 from app.integrations.dexscreener.client import dexscreener_chain_name
 from app.models import (
@@ -223,6 +224,12 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
     if not token_ids:
         return []
 
+    settings = get_settings()
+    stale_after_seconds = max(
+        settings.token_refresh_interval_seconds * 2,
+        settings.high_priority_data_freshness_seconds,
+    )
+    observed_now = datetime.now(timezone.utc)
     latest_observations = _observations_by_time(db, token_ids, latest=True)
     holder_counts: dict[int, int] = {}
     fomo_holder_counts: dict[int, int] = {}
@@ -343,6 +350,28 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             growth_multiple = current_market_cap / initial_market_cap
             growth_percent = (growth_multiple - 1) * 100
         payload = observation.raw_data if observation and isinstance(observation.raw_data, dict) else {}
+        observed_at = observation.observed_at if observation else None
+        if observed_at is not None:
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            else:
+                observed_at = observed_at.astimezone(timezone.utc)
+            market_data_age_seconds = max(0, int((observed_now - observed_at).total_seconds()))
+        else:
+            market_data_age_seconds = None
+        market_cap_source = payload.get("market_cap_source")
+        market_data_warnings = []
+        if market_data_age_seconds is None:
+            market_data_warnings.append("no_data")
+        elif market_data_age_seconds > stale_after_seconds:
+            market_data_warnings.append("stale")
+        if observation is not None:
+            if observation.liquidity is None:
+                market_data_warnings.append("liquidity_unknown")
+            elif observation.liquidity < settings.minimum_liquidity_usd:
+                market_data_warnings.append("low_liquidity")
+        if current_market_cap is not None and not market_cap_source:
+            market_data_warnings.append("market_cap_basis_unknown")
         provider_chain = dexscreener_chain_name(chain_name, network_id)
         display_chain = {
             "solana": "Solana",
@@ -363,6 +392,10 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             "is_graduated": token.is_graduated,
             "is_favorite": token.id in favorite_ids,
             "market_cap": current_market_cap,
+            "fdv": payload.get("fdv"),
+            "market_cap_source": market_cap_source,
+            "market_data_age_seconds": market_data_age_seconds,
+            "market_data_warnings": market_data_warnings,
             "liquidity": observation.liquidity if observation else None,
             "fomo_holder_count": fomo_holder_counts.get(token.id, holder_counts.get(token.id)),
             "reach_market_cap": initial_market_cap,
@@ -375,7 +408,7 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             "social_links": (social_links := _social_links(payload, provider_chain, token.contract_address)),
             "fomo_url": _fomo_token_url(token.contract_address, provider_chain),
             "first_seen_at": _utc_isoformat(token.first_seen_at or token.created_at),
-            "observed_at": _utc_isoformat(observation.observed_at) if observation else None,
+            "observed_at": _utc_isoformat(observed_at),
         })
     return result
 
