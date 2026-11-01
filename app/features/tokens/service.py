@@ -7,6 +7,7 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.features.ai_discovery.candidate_features import AI_DISCOVERY_ELIGIBILITY_VERSION
 from app.chains import chain_registry
 from app.integrations.dexscreener.client import dexscreener_chain_name
 from app.models import (
@@ -19,6 +20,7 @@ from app.models import (
     GraduationEvent,
     MarketObservation,
     RiskFinding,
+    SecurityAnalysis,
     Token,
     TraderTokenPick,
     TraderTransactionEvent,
@@ -334,6 +336,18 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
         token_id for (token_id,) in db.query(Favorite.token_id)
         .filter(Favorite.token_id.in_(token_ids)).distinct().all()
     }
+    ai_discovery_history_ids = {
+        token_id for (token_id,) in db.query(AIIntelligenceRecord.token_id)
+        .filter(
+            AIIntelligenceRecord.token_id.in_(token_ids),
+            AIIntelligenceRecord.record_type == "ai_discovery_candidate",
+            AIIntelligenceRecord.source == "ai_discovery",
+            AIIntelligenceRecord.data["eligibility_version"].as_integer()
+            == AI_DISCOVERY_ELIGIBILITY_VERSION,
+        )
+        .distinct()
+        .all()
+    }
     result = []
     for token, chain_name, network_id in rows:
         observation = latest_observations.get(token.id)
@@ -391,6 +405,7 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             "image_url": _token_image_url(payload),
             "is_graduated": token.is_graduated,
             "is_favorite": token.id in favorite_ids,
+            "has_ai_discovery_history": token.id in ai_discovery_history_ids,
             "market_cap": current_market_cap,
             "fdv": payload.get("fdv"),
             "market_cap_source": market_cap_source,
@@ -497,6 +512,7 @@ def delete_tokens(db: Session, token_ids: list[int]) -> int:
         GraduationEvent,
         MarketObservation,
         RiskFinding,
+        SecurityAnalysis,
         TraderTokenPick,
         TraderTransactionEvent,
     ):

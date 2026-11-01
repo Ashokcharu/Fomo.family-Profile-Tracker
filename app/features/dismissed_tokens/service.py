@@ -4,7 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.features.tokens.service import filter_token_records, token_display_data
-from app.models import DismissedToken, RiskFinding, Token
+from app.models import DismissedToken, RiskFinding, SecurityAnalysis, Token
 
 
 def list_dismissed_tokens(db: Session, limit: int = 20, offset: int = 0, search: str | None = None) -> list[dict]:
@@ -64,8 +64,15 @@ def dismiss_tokens(db: Session, token_ids: list[int], reason: str | None = None)
     findings_deleted = db.query(RiskFinding).filter(RiskFinding.token_id.in_(existing_ids)).delete(
         synchronize_session=False
     )
+    security_analyses_deleted = db.query(SecurityAnalysis).filter(SecurityAnalysis.token_id.in_(existing_ids)).delete(
+        synchronize_session=False
+    )
     db.commit()
-    return {"dismissed": len(new_dismissals), "risk_findings_deleted": findings_deleted}
+    return {
+        "dismissed": len(new_dismissals),
+        "risk_findings_deleted": findings_deleted,
+        "security_analyses_deleted": security_analyses_deleted,
+    }
 
 
 def dismiss_token(db: Session, token: Token, reason: str | None = None) -> DismissedToken:

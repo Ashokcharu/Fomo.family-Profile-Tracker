@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -14,11 +14,6 @@ service = AIDataService()
 @router.get("/")
 def get_ai_status(db: Session = Depends(get_db)) -> dict:
     return service.get_status(db)
-
-
-@router.get("/analyzed")
-def get_analyzed_candidates(db: Session = Depends(get_db)) -> list[dict]:
-    return service.list_analyzed_candidates(db)
 
 
 @router.post("/run")
@@ -36,11 +31,39 @@ def rate_ai_candidate(token_id: int, feedback: DiscoveryFeedback, db: Session = 
     return {"token_id": token_id, "rating": feedback.rating}
 
 
+@router.delete("/top-picks/bulk-delete")
+def remove_ai_top_picks(payload: dict | None = Body(default=None), db: Session = Depends(get_db)) -> dict:
+    token_ids = payload.get("token_ids", []) if isinstance(payload, dict) else []
+    removed = 0
+    for raw_token_id in token_ids:
+        try:
+            token_id = int(raw_token_id)
+        except (TypeError, ValueError):
+            continue
+        if service.remove_top_pick(db, token_id):
+            removed += 1
+    db.commit()
+    return {"deleted": removed, "removed": removed}
+
 @router.delete("/top-picks/{token_id}")
 def remove_ai_top_pick(token_id: int, db: Session = Depends(get_db)) -> dict:
     if not service.remove_top_pick(db, token_id):
         raise HTTPException(status_code=404, detail="Active Top 3 pick not found")
     return {"token_id": token_id, "removed": True}
+
+@router.delete("/candidates/bulk-delete")
+def remove_ai_candidates(payload: dict | None = Body(default=None), db: Session = Depends(get_db)) -> dict:
+    token_ids = payload.get("token_ids", []) if isinstance(payload, dict) else []
+    removed = 0
+    for raw_token_id in token_ids:
+        try:
+            token_id = int(raw_token_id)
+        except (TypeError, ValueError):
+            continue
+        if service.remove_candidate(db, token_id):
+            removed += 1
+    db.commit()
+    return {"deleted": removed, "removed": removed}
 
 @router.delete("/candidates/{token_id}")
 def remove_ai_candidate(token_id: int, db: Session = Depends(get_db)) -> dict:

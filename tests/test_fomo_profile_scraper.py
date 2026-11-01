@@ -48,6 +48,7 @@ def test_fomo_token_metadata_extracts_optional_quote_values() -> None:
                 "networkId": 8453,
                 "token": {"info": {
                     "holderCount": 120,
+                    "top10HoldingPercentage": "37.5%",
                     "marketData": {
                         "marketCapUsd": "25000",
                         "priceUsd": "0.25",
@@ -64,6 +65,7 @@ def test_fomo_token_metadata_extracts_optional_quote_values() -> None:
 
     assert metadata[("8453", "quoted-token")] == {
         "holder_count": 120,
+        "top_10_holding_percent": 37.5,
         "market_cap": 25000,
         "price": 0.25,
         "liquidity": 8000,
@@ -203,6 +205,7 @@ def test_fomo_metadata_persists_quote_values_for_market_fallback() -> None:
         session.flush()
 
         persist_fomo_token_metadata(session, {("8453", "quoted-token"): {
+            "top_10_holding_percent": 37.5,
             "market_cap": 25000,
             "price": 0.25,
             "liquidity": 8000,
@@ -214,6 +217,7 @@ def test_fomo_metadata_persists_quote_values_for_market_fallback() -> None:
         assert observation.source == "fomo_family_metadata"
         assert observation.provider_name == "fomo_family"
         assert observation.is_valid is False
+        assert observation.raw_data["fomo_metadata"]["top_10_holding_percent"] == 37.5
         assert (observation.market_cap, observation.price, observation.liquidity, observation.volume) == (
             25000,
             0.25,

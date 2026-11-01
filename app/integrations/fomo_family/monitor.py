@@ -445,6 +445,9 @@ class FomoFamilyActivityMonitor:
                         nested for key in ("marketData", "market_data", "metrics", "priceInfo", "price_info")
                         if isinstance((nested := source.get(key)), dict)
                     )
+                top_10_holding_percent = _fomo_top_10_holding_percentage(quote_sources)
+                if top_10_holding_percent is not None:
+                    metadata["top_10_holding_percent"] = top_10_holding_percent
                 for field, keys in {
                     "market_cap": ("marketCapUsd", "market_cap_usd", "marketCap", "market_cap"),
                     "price": ("priceUsd", "price_usd", "usdPrice", "price"),
@@ -671,6 +674,44 @@ def _fomo_quote_value(sources: list[dict[str, Any]], keys: tuple[str, ...]) -> f
                 continue
             if math.isfinite(number) and number > 0:
                 return number
+    return None
+
+
+def _fomo_top_10_holding_percentage(sources: list[dict[str, Any]]) -> float | None:
+    field_names = {
+        "top10holding",
+        "top10holdingpercent",
+        "top10holdingpercentage",
+        "top10holdersholding",
+        "top10holdersholdingpercent",
+        "top10holdersholdingpercentage",
+        "top10holderspercent",
+        "top10holderspercentage",
+        "top10percent",
+        "top10percentage",
+        "top10share",
+        "top10supplypercent",
+        "top10supplypercentage",
+    }
+    for source in sources:
+        for key, raw_value in source.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized_key not in field_names:
+                continue
+            value = raw_value
+            if isinstance(value, dict):
+                value = next(
+                    (value.get(name) for name in ("percentage", "percent", "share", "value") if value.get(name) is not None),
+                    None,
+                )
+            if isinstance(value, str):
+                value = value.strip().removesuffix("%").strip()
+            try:
+                percentage = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(percentage) and 0 <= percentage <= 100:
+                return percentage
     return None
 
 

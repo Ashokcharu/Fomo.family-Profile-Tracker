@@ -48,6 +48,7 @@ class Token(Base):
     risk_findings: Mapped[list["RiskFinding"]] = relationship(back_populates="token")
     ai_records: Mapped[list["AIIntelligenceRecord"]] = relationship(back_populates="token")
     dismissed_tokens: Mapped[list["DismissedToken"]] = relationship(back_populates="token")
+    security_analyses: Mapped[list["SecurityAnalysis"]] = relationship(back_populates="token")
 
     __table_args__ = (
         UniqueConstraint("chain_id", "normalized_address", name="uq_chain_token_identity"),
@@ -264,6 +265,30 @@ class BackgroundJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
     checkpoint: Mapped[JSON | None] = mapped_column(JSON, nullable=True)
+
+
+class SecurityAnalysis(Base):
+    __tablename__ = "security_analyses"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id"), nullable=False, index=True)
+    chain_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    token_address: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    creator_address: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    total_supply: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
+    analysis_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    last_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    analysis_payload: Mapped[JSON | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    token: Mapped[Token] = relationship(back_populates="security_analyses")
+
+    __table_args__ = (
+        UniqueConstraint("token_id", name="uq_security_analysis_token"),
+    )
 
 
 class AuditEvent(Base):

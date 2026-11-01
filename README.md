@@ -147,8 +147,8 @@ Failure rate is deliberately unavailable for immature picks. A pick must have at
 flowchart TD
     A[Automatic timer or Analyze tracked tokens button] --> B[Load active tokens from The Tokens]
     B --> C[Build features from latest market and trader data]
-    C --> D[Apply heuristic score, prior feedback and continuation adjustment]
-    D --> E[Keep up to 30 ranked candidates]
+    C --> D[Require configured market-cap growth, then score signals]
+    D --> E[Keep every growth-eligible candidate, ranked]
     E --> F{Manual run and Ollama available?}
     F -- No --> G[Return signal-ranked candidates]
     F -- Yes --> H[Send leading candidate to local Ollama]
@@ -159,18 +159,20 @@ flowchart TD
     J --> L[Update eligible Top 3 picks]
 ```
 
-AI Discovery only analyzes the active tokens in **The Tokens**. It does not search the entire blockchain. For each tracked token, its explainable signal score considers:
+AI Discovery only analyzes the active tokens in **The Tokens**. It does not search the entire blockchain. Eligibility compares the latest market cap with the token's tracked baseline (the earliest valid market-cap observation recorded after tracking began). A token must grow at least `AI_DISCOVERY_MIN_GROWTH_PERCENT` (10% by default) from that baseline before it can enter AI Discovery. The growth gate is applied before the 50-token display maximum: if 30 tokens qualify, the tab shows 30; if more than 50 qualify, it shows the top 50 eligible tokens ranked by score. AI RMC is recorded separately when the token first qualifies. If growth later falls below the threshold, the token leaves the active list and can qualify again if it recovers. Automatic drop-outs do not create a permanent exclusion; manually removed candidates remain excluded.
+
+For tokens that pass the growth gate, the explainable score considers:
 
 - Fit to the configured market-cap range and discovery ceiling.
 - Liquidity relative to the configured minimum.
 - Number of followed traders with recorded buys.
-- Growth from the tracked baseline and early positive momentum.
+- Growth from the tracked baseline (up to 35 score points) and early momentum above the minimum growth threshold (up to 25 points). For example, 20% growth scores more strongly than the 10% entry minimum.
 - Fomo Family holder count, when available.
 - Evidence strings for strengths, missing data, and risks.
 
-The automatic scan is signal-only and does not call Ollama. It runs on its own timer, separate from market refresh. Clicking **Analyze tracked tokens** creates a database background-job record and runs a manual scan. When the model is available, the app asks it to assess the leading signal candidate and blends the model score with the heuristic score; when unavailable or invalid, signal-ranked results remain usable. The LLM is not trained on these results. Candidate feedback and observed outcomes modify ranking adjustments; they do not retrain the model.
+The automatic scan is signal-only and does not call Ollama. It runs on its own timer, separate from market refresh. Clicking **Analyze tracked tokens** creates a database background-job record and runs a manual scan. When the model is available, the app asks it to assess only the leading growth-qualified candidate and blends that assessment with its heuristic score. An unchanged candidate with unchanged evidence reuses its saved assessment instead of generating again. When Ollama is unavailable or returns invalid data, signal-ranked results remain usable. The LLM is not trained on these results. Candidate feedback and observed outcomes modify ranking adjustments; they do not retrain the model.
 
-The app retains up to 30 candidates for review. Top 3 picks are a stricter subset, with no more than three active entries. A pick must move positively above both the AI baseline and the original tracked baseline, remain within the configured early-growth window (up to 2x from each baseline), and meet the confidence threshold. Picks remain pinned until their observed high reaches 10x their AI baseline or they are manually removed. AI RMC (AIRMC) is the saved market-cap reference for the candidate's first AI appearance; AI RH (AIRH) is the highest later observation used by the discovery view.
+Up to 50 candidates that pass the tracked-baseline growth gate are retained for review. Top 3 picks are a stricter subset, with no more than three active entries. A pick must move positively above both the AI baseline and the original tracked baseline, remain within the configured early-growth window (up to 2x from each baseline), and meet the confidence threshold. Picks remain pinned until their observed high reaches 10x their AI baseline or they are manually removed. AI RMC (AIRMC) is the market cap saved when the token first qualifies for AI Discovery; AI RH (AIRH) is the highest later observation used by the discovery view.
 
 ## Dashboard Tabs
 
@@ -200,7 +202,7 @@ Other API groups include `/api/v1/dashboard/overview`, `/api/v1/discoveries/`, a
 - **Fomo holders (FH):** holder count obtained from Fomo Family metadata when that data is available. It is not guaranteed to be present or current for every token.
 - **Buyer count:** distinct followed traders with a recorded buy for that token, not the number of all token holders or all on-chain wallets.
 - **Graduated:** crossed the configured market-cap threshold after an eligible baseline was established. Default threshold: `$50,000`.
-- **AI RMC / AIRMC:** market-cap reference stored when the token first appears in AI candidate tracking. AI growth is measured from this reference.
+- **AI RMC / AIRMC:** market-cap reference stored when the token first qualifies for AI Discovery. AI growth is measured from this reference.
 - **AI RH / AIRH:** highest market-cap observation since AI candidate tracking began.
 - **Trader success rate:** fraction of qualifying trader-token picks whose observed high reached the stated multiple. It is not a realized return statistic.
 
@@ -373,6 +375,7 @@ Settings are defined in `app/config.py`. Values can be supplied as environment v
 | `MINIMUM_LIQUIDITY_USD` | `5000` | Liquidity reference used by discovery scoring. |
 | `AI_DISCOVERY_ENABLED` | `true` | Enables automatic and manual AI Discovery. |
 | `AI_DISCOVERY_INTERVAL_SECONDS` | `600` | Automatic signal-only scan interval; minimum accepted value is 60 seconds. |
+| `AI_DISCOVERY_MIN_GROWTH_PERCENT` | `10` | Minimum growth from the token's tracked market-cap baseline before it can qualify. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama server URL. |
 | `OLLAMA_MODEL` | `qwen3:8b` | Model name expected on the Ollama server. |
 | `OLLAMA_NUM_THREADS` | `2` | CPU thread setting passed to Ollama. |

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+AI_DISCOVERY_ELIGIBILITY_VERSION = 2
+
 
 def build_candidate_features(token: dict, settings) -> dict:
     market_cap = _number(token.get("market_cap"))
@@ -9,23 +11,28 @@ def build_candidate_features(token: dict, settings) -> dict:
     growth = _number(token.get("growth_multiple"))
     buyers = max(0, int(_number(token.get("buyer_count")) or 0))
     holders = max(0, int(_number(token.get("fomo_holder_count")) or 0))
+    growth_percent = (growth - 1) * 100 if growth is not None and growth > 0 else None
+    minimum_growth_percent = settings.ai_discovery_min_growth_percent
 
     preferred_min = settings.discovery_preferred_min_usd
     preferred_max = settings.discovery_preferred_max_usd
     if market_cap is None:
         market_cap_score = 0.0
     elif preferred_min <= market_cap <= preferred_max:
-        market_cap_score = 25.0
+        market_cap_score = 10.0
     elif 0 < market_cap < settings.discovery_threshold_usd:
-        market_cap_score = 15.0
+        market_cap_score = 6.0
     else:
         market_cap_score = 0.0
 
-    liquidity_score = min(25.0, liquidity / settings.minimum_liquidity_usd * 25) if liquidity is not None else 0.0
-    buyer_score = min(25.0, buyers / 5 * 25)
-    growth_score = min(15.0, max(0.0, 5 + math.log2(growth) * 5)) if growth is not None and growth > 0 else 0.0
-    early_momentum_score = min(10.0, max(0.0, (growth - 1) * 50)) if growth is not None and 1 < growth < 2 else 0.0
-    holder_score = min(10.0, holders / 100 * 10) if token.get("fomo_holder_count") is not None else 0.0
+    liquidity_score = min(15.0, liquidity / settings.minimum_liquidity_usd * 15) if liquidity is not None else 0.0
+    buyer_score = min(10.0, buyers / 5 * 10)
+    growth_score = min(35.0, max(0.0, growth_percent or 0.0))
+    early_momentum_score = min(
+        25.0,
+        max(0.0, ((growth_percent or 0.0) - minimum_growth_percent) * 2.5),
+    )
+    holder_score = min(5.0, holders / 100 * 5) if token.get("fomo_holder_count") is not None else 0.0
     score_breakdown = {
         "market_cap_fit": round(market_cap_score, 1),
         "liquidity": round(liquidity_score, 1),
@@ -61,6 +68,8 @@ def build_candidate_features(token: dict, settings) -> dict:
         strengths.append(f"Early positive movement is {growth:.2f}× from the tracked baseline.")
     elif growth is not None and growth < 1:
         risks.append("Current market cap is below its tracked baseline.")
+    if growth_percent is None or growth_percent < minimum_growth_percent:
+        risks.append(f"Growth is below the {minimum_growth_percent:g}% AI Discovery minimum.")
     if token.get("fomo_holder_count") is None:
         risks.append("Holder count is unavailable.")
     elif holders < 25:
@@ -81,7 +90,7 @@ def build_candidate_features(token: dict, settings) -> dict:
         "buyer_count": buyers,
         "fomo_holder_count": holders if token.get("fomo_holder_count") is not None else None,
         "growth_multiple": growth,
-        "growth_percent": _number(token.get("growth_percent")),
+        "growth_percent": growth_percent,
         "reached_high_market_cap": _number(token.get("reached_high_market_cap")),
         "heuristic_score": round(sum(score_breakdown.values()), 1),
         "score_breakdown": score_breakdown,

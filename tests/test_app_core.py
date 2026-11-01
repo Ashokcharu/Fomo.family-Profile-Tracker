@@ -12,7 +12,8 @@ from app.chains.solana.adapter import SolanaAdapter
 from app.config import Settings
 from app.database import Base
 from app.features.dashboard.service import get_overview
-from app.models import Chain, Token
+from app.features.security_analysis.service import SecurityAnalysisService
+from app.models import Chain, MarketObservation, RiskFinding, SecurityAnalysis, Token
 from scripts.server import is_workspace_server, process_port
 from app.workers.scheduler import RefreshScheduler
 
@@ -117,3 +118,145 @@ def test_overview_reports_total_tokens_separately_from_active_tokens() -> None:
 
         assert overview["tokens"] == 1
         assert overview["total_tokens"] == 2
+
+
+def test_security_analysis_scores_market_and_risk_data() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="solana", chain_slug="solana")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="token-1",
+            normalized_address="token-1",
+            name="Alpha",
+            ticker="ALP",
+        )
+        session.add(token)
+        session.commit()
+
+        session.add(
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                market_cap=120_000.0,
+                price=0.12,
+                liquidity=600.0,
+                volume=5000.0,
+                is_valid=True,
+                raw_data={"holder_count": 12, "pair_address": "pool-1", "dex_name": "raydium"},
+            )
+        )
+        session.add(
+            RiskFinding(
+                token_id=token.id,
+                severity="high",
+                category="liquidity_risk",
+                summary="Thin liquidity",
+                confidence=0.8,
+                confirmed=True,
+            )
+        )
+        session.commit()
+
+        result = SecurityAnalysisService().analyze_token(session, token.id)
+
+        assert result["analysis_status"] == "ready"
+        assert result["risk_level"] in {"medium", "high"}
+        assert result["risk_score"] >= 30
+        assert result["liquidity_security"]["status"] == "low_liquidity"
+        assert result["analysis_metadata"]["phase"] == "phase_5"
+        assert result["analysis_metadata"]["phases_completed"] == ["phase_1", "phase_2", "phase_3", "phase_4", "phase_5"]
+        assert result["analysis_metadata"]["implementation_status"] == "complete_in_repo"
+        assert "lock_verification" in result["liquidity_security"]
+        assert "creator_wallet_cluster" in result
+        assert "creator_activity" in result
+        assert "tokens_sold_percent_supply" in result["creator_activity"]
+        assert "combined_cluster_holdings" in result["holder_concentration"]
+        assert "creator_linked_cluster_wallets" in result["holder_concentration"]
+
+
+def test_security_analysis_uses_latest_saved_fomo_top_ten_holding() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="base", chain_slug="base")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="top-ten-token",
+            normalized_address="top-ten-token",
+        )
+        session.add(token)
+        session.flush()
+        session.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="fomo_family_metadata",
+                raw_data={"fomo_metadata": {"top_10_holding_percent": 37.5}},
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="dexscreener",
+                market_cap=25000,
+                liquidity=8000,
+                raw_data={},
+            ),
+            SecurityAnalysis(
+                token_id=token.id,
+                chain_name="base",
+                token_address=token.normalized_address,
+                risk_score=0,
+                risk_level="unverified",
+                analysis_status="ready",
+                last_analyzed_at=datetime(2020, 1, 1),
+                analysis_payload={},
+            ),
+        ])
+        session.commit()
+
+        result = SecurityAnalysisService().get_analysis(session, token.id)
+
+        assert result["holder_concentration"]["top_10_percent"] == 37.5
+        assert result["holder_concentration"]["top_10_source"] == "fomo_family"
+
+
+def test_delete_token_removes_related_security_analysis() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="solana", chain_slug="solana")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="token-2",
+            normalized_address="token-2",
+            name="Bravo",
+            ticker="BRV",
+        )
+        session.add(token)
+        session.flush()
+        session.add(
+            SecurityAnalysis(
+                token_id=token.id,
+                chain_name="solana",
+                token_address="token-2",
+                risk_score=44,
+                risk_level="medium",
+                analysis_status="ready",
+            )
+        )
+        session.commit()
+
+        from app.features.tokens.service import delete_token
+
+        token_id = token.id
+        assert delete_token(session, token_id) is True
+        session.commit()
+
+        assert session.query(Token).filter(Token.id == token_id).count() == 0
+        assert session.query(SecurityAnalysis).filter(SecurityAnalysis.token_id == token_id).count() == 0

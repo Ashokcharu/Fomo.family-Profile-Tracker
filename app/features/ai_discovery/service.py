@@ -11,15 +11,17 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.database import SessionLocal
-from app.features.ai_discovery.candidate_features import build_candidate_features
+from app.features.ai_discovery.candidate_features import (
+    AI_DISCOVERY_ELIGIBILITY_VERSION,
+    build_candidate_features,
+)
 from app.features.tokens.service import list_active_token_ids, list_all_active_tokens, token_display_data
 from app.integrations.ollama.client import OllamaClient
 from app.integrations.ollama.prompts import build_discovery_prompt
 from app.models import AIIntelligenceRecord, BackgroundJob, Favorite, MarketObservation, Token
 
-MAX_AI_CANDIDATES = 50
 MAX_MODEL_CANDIDATES = 1
-MAX_STORED_RUNS_TO_SCAN = 100
+MAX_AI_CANDIDATES = 50
 MAX_TOP_PICKS = 3
 MIN_ACTIVE_CANDIDATE_SCORE = 50.0
 FEEDBACK_ADJUSTMENT = 8.0
@@ -82,8 +84,33 @@ class AIDataService:
 
         candidates = latest_run["candidates"] if latest_run else []
         if candidates:
+            candidate_ids = [candidate["token_id"] for candidate in candidates]
             excluded_ids = self._excluded_candidate_ids(db, [candidate["token_id"] for candidate in candidates])
-            candidates = [candidate for candidate in candidates if candidate["token_id"] not in excluded_ids]
+            active_ids = list_active_token_ids(db, set(candidate_ids))
+            current_data = token_display_data(db, candidate_ids)
+            eligible_candidates = []
+            for candidate in candidates:
+                token_id = candidate["token_id"]
+                current = current_data.get(token_id)
+                if (
+                    token_id in excluded_ids
+                    or token_id not in active_ids
+                    or current is None
+                    or current.get("growth_percent") is None
+                    or current["growth_percent"] < self.settings.ai_discovery_min_growth_percent
+                ):
+                    continue
+                candidate = {
+                    **candidate,
+                    "market_cap": current["market_cap"],
+                    "growth_multiple": current["growth_multiple"],
+                    "growth_percent": current["growth_percent"],
+                    "liquidity": current["liquidity"],
+                    "fomo_holder_count": current["fomo_holder_count"],
+                    "buyer_count": current["buyer_count"],
+                }
+                eligible_candidates.append(candidate)
+            candidates = eligible_candidates
         if candidates:
             candidate_ids = [candidate["token_id"] for candidate in candidates]
             baselines = self._records_by_token(db, "ai_discovery_baseline", candidate_ids)
@@ -143,8 +170,7 @@ class AIDataService:
             "model_available": model_available,
             "note": note,
             "tokens_scanned": latest_run["tokens_scanned"] if latest_run else 0,
-            "candidate_count": len(latest_run["candidates"]) if latest_run else 0,
-                        "candidate_count": len(candidates),
+            "candidate_count": len(candidates),
             "last_run_at": latest_run["last_run_at"] if latest_run else None,
             "candidates": candidates,
             "top_picks": top_picks,
@@ -214,34 +240,90 @@ class AIDataService:
             return self.get_status(db)
 
         tracked_tokens = list_all_active_tokens(db)
-        token_features = [build_candidate_features(token, self.settings) for token in tracked_tokens]
-        excluded_ids = self._excluded_candidate_ids(db, [candidate["token_id"] for candidate in token_features])
-        token_features = [candidate for candidate in token_features if candidate["token_id"] not in excluded_ids]
-        feature_by_id = {candidate["token_id"]: candidate for candidate in token_features}
-        candidate_ids = [candidate["token_id"] for candidate in token_features]
+        excluded_ids = self._excluded_candidate_ids(db, [token["id"] for token in tracked_tokens])
+        tracked_tokens = [token for token in tracked_tokens if token["id"] not in excluded_ids]
+        candidate_ids = [token["id"] for token in tracked_tokens]
         baselines = self._records_by_token(db, "ai_discovery_baseline", candidate_ids)
-        feedback = self._refresh_automatic_feedback(db, token_features, baselines)
+        prior_candidate_ids = {
+            token_id for (token_id,) in db.query(AIIntelligenceRecord.token_id)
+            .filter(
+                AIIntelligenceRecord.token_id.in_(candidate_ids),
+                AIIntelligenceRecord.record_type == "ai_discovery_candidate",
+                AIIntelligenceRecord.source == "ai_discovery",
+            )
+            .distinct()
+            .all()
+            if token_id is not None
+        } if candidate_ids else set()
+        token_features = []
+        minimum_growth = self.settings.ai_discovery_min_growth_percent
+        for token in tracked_tokens:
+            token_id = token["id"]
+            baseline = baselines.get(token_id)
+            baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
+            market_cap = token.get("market_cap")
+            ai_rmc = baseline_data.get("ai_rmc")
+            tracked_growth = token.get("growth_multiple")
+            tracked_growth_percent = token.get("growth_percent")
+            if tracked_growth is None and tracked_growth_percent is not None:
+                tracked_growth = 1 + tracked_growth_percent / 100
+            eligible = (
+                tracked_growth_percent is not None
+                and tracked_growth_percent >= minimum_growth
+                and market_cap is not None
+                and market_cap > 0
+            )
+            if eligible and token_id not in prior_candidate_ids:
+                ai_rmc = market_cap
+                baseline_data = {"ai_rmc": ai_rmc, "ai_rh": market_cap}
+                if baseline is None:
+                    baseline = AIIntelligenceRecord(
+                        token_id=token_id,
+                        record_type="ai_discovery_baseline",
+                        source="ai_discovery",
+                        manually_entered=False,
+                        data=baseline_data,
+                    )
+                    db.add(baseline)
+                    baselines[token_id] = baseline
+                else:
+                    baseline.data = baseline_data
+            ai_growth = (
+                market_cap / ai_rmc
+                if market_cap is not None and ai_rmc and ai_rmc > 0 else None
+            )
+            feature_input = {
+                **token,
+                "growth_multiple": tracked_growth,
+                "growth_percent": tracked_growth_percent,
+            }
+            candidate = build_candidate_features(feature_input, self.settings)
+            candidate["ai_rmc"] = ai_rmc
+            candidate["ai_rh"] = max(
+                (value for value in (baseline_data.get("ai_rh"), ai_rmc, market_cap) if value is not None),
+                default=None,
+            )
+            candidate["ai_growth_multiple"] = ai_growth
+            candidate["growth_multiple"] = tracked_growth
+            candidate["growth_percent"] = tracked_growth_percent
+            token_features.append(candidate)
+
+        feature_by_id = {candidate["token_id"]: candidate for candidate in token_features}
+        feedback_candidates = [
+            candidate for candidate in token_features
+            if candidate["token_id"] in prior_candidate_ids
+            or (
+                candidate.get("growth_percent") is not None
+                and candidate["growth_percent"] >= minimum_growth
+            )
+        ]
+        feedback = self._refresh_automatic_feedback(db, feedback_candidates, baselines)
         prior_run = self._latest_run(db)
         prior_candidates = {
             candidate["token_id"]: candidate
             for candidate in (prior_run or {}).get("candidates", [])
         }
-        prior_candidate_ids = {
-            candidate["token_id"] for candidate in prior_candidates.values()
-        }
         for candidate in token_features:
-            baseline = baselines.get(candidate["token_id"])
-            baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
-            ai_rmc = baseline_data.get("ai_rmc") or candidate.get("market_cap")
-            candidate["ai_rmc"] = ai_rmc
-            candidate["ai_rh"] = max(
-                (value for value in (baseline_data.get("ai_rh"), ai_rmc, candidate.get("market_cap")) if value is not None),
-                default=None,
-            )
-            candidate["ai_growth_multiple"] = (
-                round(candidate["market_cap"] / ai_rmc, 3)
-                if candidate.get("market_cap") is not None and ai_rmc else None
-            )
             candidate["continuation_adjustment"] = _continuation_adjustment(
                 candidate["ai_growth_multiple"],
                 candidate["token_id"] in prior_candidate_ids,
@@ -262,8 +344,13 @@ class AIDataService:
                     + candidate["feedback_adjustment"],
                 ),
             )
+        eligible_features = [
+            candidate for candidate in token_features
+            if candidate["growth_percent"] is not None
+            and candidate["growth_percent"] >= minimum_growth
+        ]
         candidates = sorted(
-            token_features,
+            eligible_features,
             key=lambda row: (row["selection_score"], row["heuristic_score"], row["token_id"]),
             reverse=True,
         )[:MAX_AI_CANDIDATES]
@@ -316,27 +403,32 @@ class AIDataService:
                     default=None,
                 )
                 baseline.data = {**baseline_data, "ai_rh": candidate["ai_rh"]}
-        for candidate in candidates:
-            if candidate["token_id"] not in baselines and candidate.get("market_cap") is not None:
-                baseline = AIIntelligenceRecord(
-                    token_id=candidate["token_id"],
-                    record_type="ai_discovery_baseline",
-                    source="ai_discovery",
-                    manually_entered=False,
-                    data={"ai_rmc": candidate["market_cap"], "ai_rh": candidate["ai_rh"]},
-                )
-                db.add(baseline)
-                baselines[candidate["token_id"]] = baseline
-                candidate["ai_rmc"] = candidate["market_cap"]
-                candidate["ai_growth_multiple"] = 1.0
         run_at = datetime.now(timezone.utc).isoformat()
         run_id = uuid4().hex
-        model_available = self.ollama.is_available() if use_model else False
-        model_pending = defer_model and model_available and bool(candidates)
-        assessments = (
-            self._get_model_assessments(candidates[:MAX_MODEL_CANDIDATES])
-            if model_available and candidates and not defer_model else {}
+        model_candidate = candidates[0] if candidates else None
+        cached_assessment = None
+        if model_candidate is not None:
+            previous = prior_candidates.get(model_candidate["token_id"], {})
+            model_input = _model_assessment_input(model_candidate)
+            if (
+                previous.get("model_score") is not None
+                and previous.get("model_assessment_input") == model_input
+            ):
+                cached_assessment = {
+                    "score": previous["model_score"],
+                    "summary": previous.get("summary"),
+                }
+        model_available = self._model_available() if use_model and candidates else False
+        model_pending = (
+            defer_model and model_available and bool(candidates)
+            and cached_assessment is None
         )
+        if cached_assessment is not None and model_candidate is not None:
+            assessments = {model_candidate["token_id"]: cached_assessment}
+        elif model_available and candidates and not defer_model:
+            assessments = self._get_model_assessments(candidates[:MAX_MODEL_CANDIDATES])
+        else:
+            assessments = {}
         model_used = bool(assessments)
 
         stored_candidates = []
@@ -357,12 +449,19 @@ class AIDataService:
             summary = assessment.get("summary") or _fallback_summary(candidate)
             saved = {
                 **candidate,
+                "eligibility_version": AI_DISCOVERY_ELIGIBILITY_VERSION,
                 "score": score,
+                "inactive": False,
                 "model_score": model_score,
                 "recommendation": recommendation,
                 "summary": summary,
                 "model": self.settings.ollama_model if model_score is not None else None,
                 "model_pending": model_pending,
+                "model_assessment_input": (
+                    _model_assessment_input(candidate)
+                    if model_score is not None or (model_pending and candidate is model_candidate)
+                    else None
+                ),
                 "run_id": run_id,
                 "last_run_at": run_at,
                 "tokens_scanned": len(tracked_tokens),
@@ -375,6 +474,7 @@ class AIDataService:
         for rank, candidate in enumerate(stored_candidates, start=1):
             candidate["rank"] = rank
         active_candidates = []
+        archived_candidate_ids = set()
         for candidate in stored_candidates:
             if (
                 candidate["score"] < MIN_ACTIVE_CANDIDATE_SCORE
@@ -382,13 +482,22 @@ class AIDataService:
                 and not candidate["model_pending"]
             ):
                 self._archive_candidate(db, candidate["token_id"], candidate, "failed_low_signal")
+                archived_candidate_ids.add(candidate["token_id"])
             else:
                 active_candidates.append(candidate)
         active_candidate_ids = {candidate["token_id"] for candidate in active_candidates}
         for token_id, candidate in prior_candidates.items():
-            if token_id in active_candidate_ids or token_id in excluded_ids:
+            if token_id in active_candidate_ids or token_id in excluded_ids or token_id in archived_candidate_ids:
                 continue
-            reason = "no_longer_eligible" if token_id not in feature_by_id else "replaced_by_better_candidates"
+            feature = feature_by_id.get(token_id)
+            if feature is None:
+                reason = "no_longer_eligible"
+            elif feature.get("growth_percent") is None or feature["growth_percent"] < minimum_growth:
+                reason = "growth_below_threshold"
+            elif feature.get("market_cap") is not None and feature["market_cap"] > 0:
+                reason = "outside_candidate_limit"
+            else:
+                reason = "no_longer_eligible"
             self._archive_candidate(db, token_id, candidate, reason)
 
         stored_candidates = active_candidates
@@ -411,10 +520,10 @@ class AIDataService:
             note = f"Ranked {len(tracked_tokens)} active tracked tokens using observable signals. {self.settings.ollama_model} is assessing the top candidate in the background."
         elif model_used:
             status = "model_assisted"
-            note = f"Ranked {len(tracked_tokens)} active tracked tokens; showing the top {len(stored_candidates)}. Ollama assessed the top {len(assessments)} signal candidates."
+            note = f"Ranked {len(tracked_tokens)} active tracked tokens; showing up to {MAX_AI_CANDIDATES} growth-eligible candidates. Ollama assessed the top {len(assessments)} signal candidates."
         else:
             status = "heuristic_fallback"
-            note = f"Assessed {len(tracked_tokens)} active tracked tokens using observable signals; Ollama was unavailable or returned no valid assessments."
+            note = f"Showing {len(stored_candidates)} growth-eligible candidates (maximum {MAX_AI_CANDIDATES}) from {len(tracked_tokens)} active tracked tokens; Ollama was unavailable or returned no valid assessments."
         response = {
             "enabled": True,
             "status": status,
@@ -436,17 +545,14 @@ class AIDataService:
                 .filter(
                     AIIntelligenceRecord.record_type == "ai_discovery_candidate",
                     AIIntelligenceRecord.source == "ai_discovery",
+                    AIIntelligenceRecord.data["run_id"].as_string() == run_id,
                 )
                 .order_by(AIIntelligenceRecord.id.desc())
-                .limit(MAX_STORED_RUNS_TO_SCAN)
                 .all()
             )
-            run_records = [
-                record for record in records
-                if isinstance(record.data, dict) and record.data.get("run_id") == run_id
-            ]
-            if not run_records:
+            if not records:
                 return
+            run_records = records
             run_records.sort(key=lambda record: record.data.get("rank", 0))
             assessments = self._get_model_assessments([run_records[0].data])
             assessment = assessments.get(run_records[0].token_id)
@@ -465,6 +571,7 @@ class AIDataService:
                     )
                     data["summary"] = assessment.get("summary") or data["summary"]
                     data["model"] = self.settings.ollama_model
+                    data["model_assessment_input"] = _model_assessment_input(data)
                     data["recommendation"] = _recommendation(data["score"])
                 record.data = data
             run_records.sort(
@@ -535,6 +642,83 @@ class AIDataService:
         db.commit()
         return True
 
+    def list_analyzed_candidates(self, db: Session) -> list[dict[str, Any]]:
+        excluded = (
+            db.query(AIIntelligenceRecord)
+            .filter(
+                AIIntelligenceRecord.record_type == "ai_discovery_exclusion",
+                AIIntelligenceRecord.source == "ai_discovery",
+            )
+            .order_by(AIIntelligenceRecord.id.desc())
+            .all()
+        )
+        results: list[dict[str, Any]] = []
+        for record in excluded:
+            if record.token_id is None:
+                continue
+            data = record.data if isinstance(record.data, dict) else {}
+            candidate_data = data.get("candidate") if isinstance(data.get("candidate"), dict) else {}
+            latest_candidate = (
+                db.query(AIIntelligenceRecord)
+                .filter(
+                    AIIntelligenceRecord.token_id == record.token_id,
+                    AIIntelligenceRecord.record_type == "ai_discovery_candidate",
+                    AIIntelligenceRecord.source == "ai_discovery",
+                )
+                .order_by(AIIntelligenceRecord.id.desc())
+                .first()
+            )
+            current_candidate = latest_candidate.data if latest_candidate and isinstance(latest_candidate.data, dict) else {}
+            merged = {**current_candidate, **candidate_data}
+
+            latest_market = (
+                db.query(MarketObservation)
+                .filter(
+                    MarketObservation.token_id == record.token_id,
+                    MarketObservation.is_valid.is_(True),
+                    MarketObservation.market_cap.is_not(None),
+                )
+                .order_by(MarketObservation.observed_at.desc(), MarketObservation.id.desc())
+                .first()
+            )
+            if latest_market is not None:
+                merged["market_cap"] = latest_market.market_cap
+                merged["liquidity"] = latest_market.liquidity
+                merged["price"] = latest_market.price
+                merged["source"] = latest_market.source
+
+            baseline = (
+                db.query(AIIntelligenceRecord)
+                .filter(
+                    AIIntelligenceRecord.token_id == record.token_id,
+                    AIIntelligenceRecord.record_type == "ai_discovery_baseline",
+                    AIIntelligenceRecord.source == "ai_discovery",
+                )
+                .order_by(AIIntelligenceRecord.id.desc())
+                .first()
+            )
+            baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
+            ai_rh_values = [
+                merged.get("ai_rh"),
+                baseline_data.get("ai_rh"),
+                baseline_data.get("ai_rmc"),
+                merged.get("market_cap"),
+            ]
+            ai_rh = max((value for value in ai_rh_values if value is not None), default=None)
+            if ai_rh is not None:
+                merged["ai_rh"] = ai_rh
+
+            results.append({
+                "token_id": record.token_id,
+                "score": merged.get("score"),
+                "market_cap": merged.get("market_cap"),
+                "liquidity": merged.get("liquidity"),
+                "ai_rh": merged.get("ai_rh"),
+                "archive_reason": data.get("reason") or candidate_data.get("archive_reason") or "archived",
+                "ai_analyzed_at": merged.get("last_run_at") or record.created_at.isoformat(),
+            })
+        return results
+
     def _archive_candidate(
         self,
         db: Session,
@@ -549,135 +733,63 @@ class AIDataService:
                 AIIntelligenceRecord.record_type == "ai_discovery_exclusion",
                 AIIntelligenceRecord.source == "ai_discovery",
             )
+            .order_by(AIIntelligenceRecord.id.desc())
             .first()
         )
-        if exclusion is not None:
-            return
-        db.add(AIIntelligenceRecord(
-            token_id=token_id,
-            record_type="ai_discovery_exclusion",
-            source="ai_discovery",
-            manually_entered=reason == "manually_removed",
-            data={
-                "excluded_at": datetime.now(timezone.utc).isoformat(),
-                "reason": reason,
-                "candidate": candidate,
-            },
-        ))
-
-    def list_analyzed_candidates(self, db: Session) -> list[dict[str, Any]]:
-        exclusions = (
-            db.query(AIIntelligenceRecord)
-            .filter(
-                AIIntelligenceRecord.record_type == "ai_discovery_exclusion",
-                AIIntelligenceRecord.source == "ai_discovery",
+        existing_data = exclusion.data if exclusion and isinstance(exclusion.data, dict) else {}
+        existing_is_manual = bool(
+            exclusion and (
+                exclusion.manually_entered or existing_data.get("reason") == "manually_removed"
             )
-            .order_by(AIIntelligenceRecord.id.desc())
-            .all()
         )
-        latest_exclusions = {}
-        for exclusion in exclusions:
-            if exclusion.token_id is not None and exclusion.token_id not in latest_exclusions:
-                latest_exclusions[exclusion.token_id] = exclusion
-        if not latest_exclusions:
-            return []
-
-        token_ids = list(latest_exclusions)
-        display_data_by_token = token_display_data(db, token_ids)
-        baselines = self._records_by_token(db, "ai_discovery_baseline", token_ids)
-        baseline_ids = [baseline.id for baseline in baselines.values()]
-        ai_highs = {}
-        if baseline_ids:
-            ai_highs = dict(
-                db.query(
-                    MarketObservation.token_id,
-                    func.max(MarketObservation.market_cap),
-                )
-                .join(
-                    AIIntelligenceRecord,
-                    and_(
-                        AIIntelligenceRecord.token_id == MarketObservation.token_id,
-                        AIIntelligenceRecord.record_type == "ai_discovery_baseline",
-                        AIIntelligenceRecord.source == "ai_discovery",
-                    ),
-                )
-                .filter(
-                    AIIntelligenceRecord.id.in_(baseline_ids),
-                    MarketObservation.is_valid.is_(True),
-                    MarketObservation.market_cap.is_not(None),
-                    MarketObservation.observed_at >= AIIntelligenceRecord.created_at,
-                )
-                .group_by(MarketObservation.token_id)
-                .all()
-            )
-        favorite_ids = {
-            token_id for (token_id,) in db.query(Favorite.token_id)
-            .filter(Favorite.token_id.in_(token_ids))
-            .all()
+        if existing_is_manual and reason != "manually_removed":
+            return
+        archive_data = {
+            "excluded_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "candidate": candidate,
         }
-        candidate_records = (
+        if exclusion is not None:
+            exclusion.manually_entered = reason == "manually_removed"
+            exclusion.data = archive_data
+        else:
+            db.add(AIIntelligenceRecord(
+                token_id=token_id,
+                record_type="ai_discovery_exclusion",
+                source="ai_discovery",
+                manually_entered=reason == "manually_removed",
+                data=archive_data,
+            ))
+        latest_candidate = (
             db.query(AIIntelligenceRecord)
             .filter(
-                AIIntelligenceRecord.token_id.in_(latest_exclusions),
+                AIIntelligenceRecord.token_id == token_id,
                 AIIntelligenceRecord.record_type == "ai_discovery_candidate",
                 AIIntelligenceRecord.source == "ai_discovery",
             )
             .order_by(AIIntelligenceRecord.id.desc())
-            .all()
+            .first()
         )
-        latest_candidates = {}
-        for record in candidate_records:
-            if record.token_id not in latest_candidates and isinstance(record.data, dict):
-                latest_candidates[record.token_id] = record.data
-
-        analyzed = []
-        for token_id, exclusion in latest_exclusions.items():
-            token = db.get(Token, token_id)
-            if token is None:
-                continue
-            exclusion_data = exclusion.data if isinstance(exclusion.data, dict) else {}
-            candidate = exclusion_data.get("candidate") or latest_candidates.get(token_id, {})
-            display_data = display_data_by_token.get(token_id, {})
-            baseline = baselines.get(token_id)
-            baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
-            analyzed.append({
-                **candidate,
-                **display_data,
-                "token_id": token_id,
-                "name": token.name or display_data.get("name") or candidate.get("name"),
-                "ticker": token.ticker or display_data.get("ticker") or candidate.get("ticker"),
-                "chain_name": display_data.get("chain_name") or token.chain.chain_name,
-                "contract_address": token.contract_address,
-                "is_favorite": token_id in favorite_ids,
-                "ai_discovery_since": _datetime_iso_utc(baseline.created_at) if baseline else candidate.get("ai_discovery_since"),
-                "ai_rmc": baseline_data.get("ai_rmc", candidate.get("ai_rmc")),
-                "ai_rh": max(
-                    (value for value in (
-                        baseline_data.get("ai_rh"),
-                        baseline_data.get("ai_rmc"),
-                        candidate.get("ai_rh"),
-                        ai_highs.get(token_id),
-                        display_data.get("market_cap"),
-                    ) if value is not None),
-                    default=None,
-                ),
-                "ai_analyzed_at": exclusion_data.get("excluded_at") or _datetime_iso_utc(exclusion.created_at),
-                "archive_reason": exclusion_data.get("reason", "manually_removed"),
-            })
-        return analyzed
+        if latest_candidate and isinstance(latest_candidate.data, dict):
+            latest_candidate.data = {**latest_candidate.data, "inactive": True}
 
     def _excluded_candidate_ids(self, db: Session, token_ids: list[int]) -> set[int]:
         if not token_ids:
             return set()
+        records = db.query(AIIntelligenceRecord).filter(
+            AIIntelligenceRecord.token_id.in_(token_ids),
+            AIIntelligenceRecord.record_type == "ai_discovery_exclusion",
+            AIIntelligenceRecord.source == "ai_discovery",
+        ).all()
         return {
-            token_id for (token_id,) in db.query(AIIntelligenceRecord.token_id)
-            .filter(
-                AIIntelligenceRecord.token_id.in_(token_ids),
-                AIIntelligenceRecord.record_type == "ai_discovery_exclusion",
-                AIIntelligenceRecord.source == "ai_discovery",
+            record.token_id for record in records
+            if record.token_id is not None and (
+                record.manually_entered
+                or (
+                    isinstance(record.data, dict)
+                    and record.data.get("reason") == "manually_removed"
+                )
             )
-            .all()
-            if token_id is not None
         }
 
     def _records_by_token(self, db: Session, record_type: str, token_ids: list[int]) -> dict[int, AIIntelligenceRecord]:
@@ -978,24 +1090,7 @@ class AIDataService:
 
     def _get_model_assessments(self, candidates: list[dict]) -> dict[int, dict]:
         model_candidates = [
-            {
-                key: candidate.get(key)
-                for key in (
-                    "token_id",
-                    "name",
-                    "ticker",
-                    "chain_name",
-                    "market_cap",
-                    "liquidity",
-                    "buyer_count",
-                    "fomo_holder_count",
-                    "growth_multiple",
-                    "heuristic_score",
-                    "score_breakdown",
-                    "strengths",
-                    "risks",
-                )
-            }
+            _model_assessment_input(candidate)
             for candidate in candidates[:MAX_MODEL_CANDIDATES]
         ]
         result = self.ollama.generate(build_discovery_prompt(model_candidates))
@@ -1024,41 +1119,45 @@ class AIDataService:
         return assessments
 
     def _latest_run(self, db: Session) -> dict[str, Any] | None:
-        records = (
+        latest_record = (
             db.query(AIIntelligenceRecord)
             .filter(
                 AIIntelligenceRecord.record_type == "ai_discovery_candidate",
                 AIIntelligenceRecord.source == "ai_discovery",
             )
-            .order_by(AIIntelligenceRecord.created_at.desc(), AIIntelligenceRecord.id.desc())
-            .limit(MAX_STORED_RUNS_TO_SCAN)
-            .all()
+            .order_by(AIIntelligenceRecord.id.desc())
+            .first()
         )
-        if not records:
+        if latest_record is None or not isinstance(latest_record.data, dict):
             return None
-        newest_data = records[0].data if isinstance(records[0].data, dict) else {}
-        run_id = newest_data.get("run_id")
+        run_id = latest_record.data.get("run_id")
         if not run_id:
             return None
-        run_records = [
-            record for record in records
-            if isinstance(record.data, dict) and record.data.get("run_id") == run_id
-        ]
-        candidates = [record.data for record in run_records]
+        run_records = (
+            db.query(AIIntelligenceRecord)
+            .filter(
+                AIIntelligenceRecord.record_type == "ai_discovery_candidate",
+                AIIntelligenceRecord.source == "ai_discovery",
+                AIIntelligenceRecord.data["run_id"].as_string() == run_id,
+            )
+            .all()
+        )
+        run_data = [record.data for record in run_records]
+        candidates = [data for data in run_data if not data.get("inactive")]
         candidates.sort(key=lambda row: row.get("rank", 0))
-        scanned = int(candidates[0].get("tokens_scanned", 0)) if candidates else 0
-        last_run_at = candidates[0].get("last_run_at") if candidates else None
+        scanned = int(run_data[0].get("tokens_scanned", 0)) if run_data else 0
+        last_run_at = run_data[0].get("last_run_at") if run_data else None
         model_used = any(candidate.get("model_score") is not None for candidate in candidates)
         model_pending = any(candidate.get("model_pending") for candidate in candidates)
         if model_used:
             status = "model_assisted"
-            note = f"Ranked {scanned} active tracked tokens; showing the top {len(candidates)}. Ollama assessed the top signal candidate."
+            note = f"Ranked {scanned} active tracked tokens; showing up to {MAX_AI_CANDIDATES} growth-eligible candidates. Ollama assessed the top signal candidate."
         elif model_pending:
             status = "model_pending"
             note = f"Ranked {scanned} active tracked tokens using observable signals. {self.settings.ollama_model} is assessing the top candidate in the background."
         else:
             status = "heuristic_fallback"
-            note = f"Showing the saved top {len(candidates)} from {scanned} active tracked tokens using observable signal scoring."
+            note = f"Showing {len(candidates)} growth-eligible candidates (maximum {MAX_AI_CANDIDATES}) from {scanned} active tracked tokens using observable signal scoring."
         return {"candidates": candidates, "tokens_scanned": scanned, "last_run_at": last_run_at, "status": status, "note": note}
 
 
@@ -1067,6 +1166,29 @@ def _fallback_summary(candidate: dict) -> str:
     risks = "; ".join(candidate["risks"][:2])
     parts = [part for part in (strengths, f"Risks: {risks}" if risks else "No tracked risk flags") if part]
     return ". ".join(parts)[:240] or "Insufficient tracked market data for a detailed assessment."
+
+
+def _model_assessment_input(candidate: dict) -> dict:
+    return {
+        key: candidate.get(key)
+        for key in (
+            "token_id",
+            "name",
+            "ticker",
+            "chain_name",
+            "market_cap",
+            "ai_rmc",
+            "ai_growth_multiple",
+            "growth_percent",
+            "liquidity",
+            "buyer_count",
+            "fomo_holder_count",
+            "heuristic_score",
+            "score_breakdown",
+            "strengths",
+            "risks",
+        )
+    }
 
 
 def _datetime_iso_utc(value: datetime) -> str:

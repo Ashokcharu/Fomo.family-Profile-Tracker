@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     minimum_liquidity_usd: float = 5_000.0
     high_priority_data_freshness_seconds: int = 60
 
+    security_analysis_enabled: bool = True
+    security_analysis_interval_seconds: int = Field(default=300, ge=60)
+    security_analysis_batch_size: int = Field(default=10, ge=1)
+    security_analysis_cache_ttl_seconds: int = Field(default=300, ge=30)
+    creator_connected_holdings_threshold: float = 10.0
+    large_holder_threshold: float = 10.0
+
     request_timeout_seconds: int = 15
     max_retries: int = 3
     backoff_factor: float = 2.0
@@ -40,6 +47,7 @@ class Settings(BaseSettings):
     pagination_max_limit: int = 200
     ai_discovery_enabled: bool = True
     ai_discovery_interval_seconds: int = Field(default=600, ge=60)
+    ai_discovery_min_growth_percent: float = Field(default=10.0, ge=0, le=1000)
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
     ollama_num_threads: int = Field(default=2, ge=1, le=32)

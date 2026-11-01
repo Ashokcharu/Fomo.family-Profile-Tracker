@@ -22,6 +22,35 @@ def test_helius_keys_rotate_without_duplicates() -> None:
     assert seen == {"k1", "k2", "k3"}
 
 
+def test_helius_token_holder_metadata_is_normalized(monkeypatch) -> None:
+    def fake_post(url, json, timeout):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "result": {
+                        "value": [
+                            {"address": "A", "amount": "100", "uiAmount": 100},
+                            {"address": "B", "amount": "60", "uiAmount": 60},
+                            {"address": "C", "amount": "40", "uiAmount": 40},
+                        ],
+                        "total_supply": 200,
+                    }
+                }
+
+        return Response()
+
+    monkeypatch.setattr("app.integrations.helius.client.httpx.post", fake_post)
+    client = HeliusClient(api_keys=["key-1"])
+    result = client.fetch_token_holders("mint-1", limit=10)
+
+    assert result["status"] == "ok"
+    assert result["holder_count"] == 3
+    assert result["top_5_percentage"] == 100.0
+
+
 def test_manual_followed_user_add_is_deduped() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)

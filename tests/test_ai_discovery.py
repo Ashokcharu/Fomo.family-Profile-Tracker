@@ -3,16 +3,23 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
-from app.database import Base
-from app.features.ai_discovery.candidate_features import build_candidate_features
+from app.database import Base, get_db
+from app.features.ai_discovery.candidate_features import (
+    AI_DISCOVERY_ELIGIBILITY_VERSION,
+    build_candidate_features,
+)
+from app.main import app
 from app.features.ai_discovery import service as ai_discovery_service
 from app.features.ai_discovery.service import AIDataService
+from app.features.tokens.service import token_display_data
 from app.integrations.ollama.client import OllamaClient
-from app.models import AIIntelligenceRecord, BackgroundJob, Chain, DismissedToken, Favorite, FollowedTrader, MarketObservation, Token, TraderTransactionEvent
+from app.models import AIIntelligenceRecord, BackgroundJob, Chain, DismissedToken, Favorite, FollowedTrader, GraduationEvent, MarketObservation, Token, TraderTransactionEvent
 
 
 class StubOllama:
@@ -21,14 +28,36 @@ class StubOllama:
         self.availability_checks = 0
         self.response = response or {"assessments": []}
         self.prompt = ""
+        self.generation_calls = 0
 
     def is_available(self) -> bool:
         self.availability_checks += 1
         return self.available
 
     def generate(self, prompt: str) -> dict:
+        self.generation_calls += 1
         self.prompt = prompt
         return {"status": "ok", "response": json.dumps(self.response)}
+
+
+def add_ai_baseline(db: Session, token_id: int, market_cap: float) -> None:
+    token = db.get(Token, token_id)
+    if token is not None:
+        token.first_seen_at = datetime.now(timezone.utc) - timedelta(days=2)
+    db.add(MarketObservation(
+        token_id=token_id,
+        source="test_baseline",
+        observed_at=datetime.now(timezone.utc) - timedelta(days=1),
+        market_cap=market_cap,
+        liquidity=10_000,
+    ))
+    db.add(AIIntelligenceRecord(
+        token_id=token_id,
+        record_type="ai_discovery_baseline",
+        source="ai_discovery",
+        manually_entered=False,
+        data={"ai_rmc": market_cap, "ai_rh": market_cap},
+    ))
 
 
 def test_ollama_generation_limits_cpu_and_unloads_model(monkeypatch) -> None:
@@ -71,6 +100,7 @@ def test_discovery_uses_active_tokens_only_and_rejects_unknown_model_ids() -> No
             DismissedToken(token_id=dismissed.id, reason="not tracked"),
             MarketObservation(token_id=active.id, source="test", market_cap=20_000, liquidity=10_000),
         ])
+        add_ai_baseline(db, active.id, 10_000)
         db.commit()
 
         ollama = StubOllama(True, {"assessments": [
@@ -83,7 +113,7 @@ def test_discovery_uses_active_tokens_only_and_rejects_unknown_model_ids() -> No
         assert result["status"] == "model_assisted"
         assert result["tokens_scanned"] == 1
         assert [candidate["token_id"] for candidate in result["candidates"]] == [active.id]
-        assert result["candidates"][0]["score"] == 62.5
+        assert result["candidates"][0]["score"] == 83.5
         assert "Must be ignored" not in result["candidates"][0]["summary"]
         prompt_candidates = json.loads(ollama.prompt.split("Candidate: ", 1)[1])
         assert [candidate["token_id"] for candidate in prompt_candidates] == [active.id]
@@ -104,6 +134,7 @@ def test_discovery_falls_back_to_tracked_signals_when_ollama_is_unavailable() ->
         db.add(token)
         db.flush()
         db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        add_ai_baseline(db, token.id, 10_000)
         db.commit()
 
         ollama = StubOllama(False)
@@ -111,7 +142,7 @@ def test_discovery_falls_back_to_tracked_signals_when_ollama_is_unavailable() ->
 
         assert result["status"] == "heuristic_fallback"
         assert result["tokens_scanned"] == 1
-        assert result["candidates"][0]["heuristic_score"] == 55
+        assert result["candidates"][0]["heuristic_score"] == 85
         assert ollama.prompt == ""
 
 
@@ -126,6 +157,7 @@ def test_discovery_defers_and_persists_qwen_assessment() -> None:
         db.add(token)
         db.flush()
         db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        add_ai_baseline(db, token.id, 10_000)
         db.commit()
 
         ollama = StubOllama(True, {"assessments": [
@@ -152,7 +184,163 @@ def test_discovery_defers_and_persists_qwen_assessment() -> None:
         assert datetime.fromisoformat(completed["candidates"][0]["ai_discovery_since"]).tzinfo == timezone.utc
         db.add(Favorite(token_id=token.id))
         db.commit()
-        assert service.get_status(db)["candidates"][0]["is_favorite"] is True
+        assert service.get_status(db)["candidates"] == []
+
+
+def test_ai_bulk_delete_routes_accept_token_ids_before_detail_routes() -> None:
+    client = TestClient(app)
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+
+    def override_get_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with Session(engine) as db:
+            chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+            db.add(chain)
+            db.flush()
+            token = Token(chain_id=chain.id, contract_address="bulk-delete-token", normalized_address="bulk-delete-token")
+            db.add(token)
+            db.flush()
+            token_id = token.id
+            db.add(AIIntelligenceRecord(
+                token_id=token_id,
+                record_type="ai_discovery_candidate",
+                source="ai_discovery",
+                data={"token_id": token_id, "score": 75, "name": "Bulk Delete"},
+            ))
+            db.add(AIIntelligenceRecord(
+                token_id=token_id,
+                record_type="ai_discovery_top_pick",
+                source="ai_discovery",
+                data={"token_id": token_id, "score": 75, "active": True, "name": "Bulk Delete"},
+            ))
+            db.commit()
+
+        candidate_response = client.request(
+            "DELETE",
+            "/api/v1/ai-discovery/candidates/bulk-delete",
+            json={"token_ids": [token_id]},
+        )
+        top_pick_response = client.request(
+            "DELETE",
+            "/api/v1/ai-discovery/top-picks/bulk-delete",
+            json={"token_ids": [token_id]},
+        )
+
+        assert candidate_response.status_code == 200
+        assert candidate_response.json()["deleted"] == 1
+        assert top_pick_response.status_code == 200
+        assert top_pick_response.json()["deleted"] == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_ai_history_flag_is_returned_for_tracked_and_favorite_tokens() -> None:
+    client = TestClient(app)
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+
+    def override_get_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with Session(engine) as db:
+            chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+            db.add(chain)
+            db.flush()
+            token = Token(
+                chain_id=chain.id,
+                contract_address="ai-history-token",
+                normalized_address="ai-history-token",
+            )
+            db.add(token)
+            db.flush()
+            token_id = token.id
+            db.add_all([
+                AIIntelligenceRecord(
+                    token_id=token_id,
+                    record_type="ai_discovery_candidate",
+                    source="ai_discovery",
+                    data={
+                        "token_id": token.id,
+                        "eligibility_version": AI_DISCOVERY_ELIGIBILITY_VERSION,
+                    },
+                ),
+                AIIntelligenceRecord(
+                    token_id=token_id,
+                    record_type="ai_discovery_exclusion",
+                    source="ai_discovery",
+                    manually_entered=True,
+                    data={"reason": "manually_removed"},
+                ),
+            ])
+            db.commit()
+
+        tracked = client.get("/api/v1/tokens/").json()
+        with Session(engine) as db:
+            db.add(Favorite(token_id=token_id))
+            db.add(GraduationEvent(
+                token_id=token_id,
+                market_cap_at_graduation=100_000,
+                threshold_usd=100_000,
+                highest_observed_market_cap=120_000,
+            ))
+            db.commit()
+        favorites = client.get("/api/v1/favorites/").json()
+        graduated = client.get("/api/v1/graduated-tokens/").json()
+
+        assert tracked[0]["has_ai_discovery_history"] is True
+        assert favorites[0]["has_ai_discovery_history"] is True
+        assert graduated[0]["has_ai_discovery_history"] is True
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_legacy_ai_candidate_history_does_not_show_new_badge() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="legacy-ai-badge",
+            normalized_address="legacy-ai-badge",
+        )
+        db.add(token)
+        db.flush()
+        db.add(AIIntelligenceRecord(
+            token_id=token.id,
+            record_type="ai_discovery_candidate",
+            source="ai_discovery",
+            data={"token_id": token.id, "score": 80},
+        ))
+        db.commit()
+
+        assert token_display_data(db, [token.id])[token.id]["has_ai_discovery_history"] is False
 
 
 def test_queue_discovery_returns_before_token_scan() -> None:
@@ -180,6 +368,7 @@ def test_queued_discovery_worker_completes_with_tracked_signal_results() -> None
         db.add(token)
         db.flush()
         db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        add_ai_baseline(db, token.id, 10_000)
         db.commit()
 
         service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
@@ -205,14 +394,17 @@ def test_removed_candidate_stays_tracked_but_is_excluded_from_future_ai_runs() -
         db.add(token)
         db.flush()
         db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        add_ai_baseline(db, token.id, 10_000)
         db.commit()
 
         service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
         service.run_discovery(db, use_model=False)
         assert service.get_status(db)["candidate_count"] == 1
+        assert token_display_data(db, [token.id])[token.id]["has_ai_discovery_history"] is True
 
         assert service.remove_candidate(db, token.id) is True
         assert service.get_status(db)["candidate_count"] == 0
+        assert token_display_data(db, [token.id])[token.id]["has_ai_discovery_history"] is True
         analyzed = service.list_analyzed_candidates(db)
         assert len(analyzed) == 1
         assert analyzed[0]["token_id"] == token.id
@@ -238,7 +430,7 @@ def test_removed_candidate_stays_tracked_but_is_excluded_from_future_ai_runs() -
         assert db.get(Token, token.id) is not None
 
 
-def test_candidate_replaced_by_a_better_ranked_token_is_archived(monkeypatch) -> None:
+def test_discovery_limits_results_to_top_50_growth_eligible_candidates(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as db:
@@ -255,6 +447,8 @@ def test_candidate_replaced_by_a_better_ranked_token_is_archived(monkeypatch) ->
             MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000)
             for token in tokens
         ])
+        for token in tokens:
+            add_ai_baseline(db, token.id, 10_000)
         db.commit()
 
         original_builder = ai_discovery_service.build_candidate_features
@@ -275,15 +469,14 @@ def test_candidate_replaced_by_a_better_ranked_token_is_archived(monkeypatch) ->
         db.flush()
         replacement_id = replacement.id
         db.add(MarketObservation(token_id=replacement.id, source="test", market_cap=20_000, liquidity=10_000))
+        add_ai_baseline(db, replacement.id, 10_000)
         db.commit()
 
         second_run = service.run_discovery(db, use_model=False)
-        assert replacement.id in {candidate["token_id"] for candidate in second_run["candidates"]}
-        assert tokens[0].id not in {candidate["token_id"] for candidate in second_run["candidates"]}
-        analyzed = service.list_analyzed_candidates(db)
-        replaced = next(candidate for candidate in analyzed if candidate["token_id"] == tokens[0].id)
-        assert replaced["archive_reason"] == "replaced_by_better_candidates"
-        assert replaced["score"] is not None
+        candidate_ids = {candidate["token_id"] for candidate in second_run["candidates"]}
+        assert len(second_run["candidates"]) == 50
+        assert replacement.id in candidate_ids
+        assert sum(token.id in candidate_ids for token in tokens) == 49
 
 
 def test_low_signal_candidate_is_archived_as_failed(monkeypatch) -> None:
@@ -297,13 +490,14 @@ def test_low_signal_candidate_is_archived_as_failed(monkeypatch) -> None:
         db.add(token)
         db.flush()
         db.add(MarketObservation(token_id=token.id, source="test", market_cap=20_000, liquidity=10_000))
+        add_ai_baseline(db, token.id, 10_000)
         db.commit()
 
         original_builder = ai_discovery_service.build_candidate_features
 
         def score_candidate_low(token_data, settings):
             features = original_builder(token_data, settings)
-            features["heuristic_score"] = 40
+            features["heuristic_score"] = 20
             return features
 
         monkeypatch.setattr(ai_discovery_service, "build_candidate_features", score_candidate_low)
@@ -322,22 +516,222 @@ def test_low_signal_candidate_is_archived_as_failed(monkeypatch) -> None:
 
 def test_early_positive_movement_gets_a_bounded_momentum_signal() -> None:
     settings = Settings()
-    early = build_candidate_features({
+    minimum_growth = build_candidate_features({
         "id": 1,
-        "market_cap": 5_100,
+        "market_cap": 5_500,
         "liquidity": 5_000,
-        "growth_multiple": 1.02,
+        "growth_multiple": 1.10,
     }, settings)
-    already_grown = build_candidate_features({
+    stronger_growth = build_candidate_features({
         "id": 2,
-        "market_cap": 10_000,
+        "market_cap": 6_000,
         "liquidity": 5_000,
-        "growth_multiple": 2.0,
+        "growth_multiple": 1.20,
     }, settings)
 
-    assert early["score_breakdown"]["early_momentum"] == 1.0
-    assert early["score_breakdown"]["early_momentum"] <= 10
-    assert already_grown["score_breakdown"]["early_momentum"] == 0
+    assert minimum_growth["score_breakdown"]["observed_growth"] == 10.0
+    assert minimum_growth["score_breakdown"]["early_momentum"] == 0.0
+    assert stronger_growth["score_breakdown"]["observed_growth"] == 20.0
+    assert stronger_growth["score_breakdown"]["early_momentum"] == 25.0
+
+
+def test_growth_gate_allows_automatic_reentry_and_reuses_unchanged_ollama_assessment() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="growth-gate", normalized_address="growth-gate")
+        db.add(token)
+        db.flush()
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            market_cap=10_000,
+            liquidity=10_000,
+        ))
+        db.commit()
+
+        observed_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+        def observe(market_cap: float, seconds: int) -> None:
+            db.add(MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=observed_at + timedelta(seconds=seconds),
+                market_cap=market_cap,
+                liquidity=10_000,
+            ))
+            db.commit()
+
+        ollama = StubOllama(True, {"assessments": [
+            {"token_id": token.id, "score": 80, "summary": "Growth-qualified evidence."},
+        ]})
+        service = AIDataService(Settings(ai_discovery_enabled=True), ollama)
+
+        first = service.run_discovery(db)
+        assert first["candidates"] == []
+        assert db.query(AIIntelligenceRecord).filter_by(
+            token_id=token.id,
+            record_type="ai_discovery_baseline",
+        ).count() == 0
+        assert ollama.availability_checks == 0
+
+        observe(10_999, 1)
+        assert service.run_discovery(db)["candidates"] == []
+        assert ollama.generation_calls == 0
+
+        observe(11_000, 2)
+        qualified = service.run_discovery(db)
+        assert round(qualified["candidates"][0]["growth_percent"], 2) == 10.0
+        assert qualified["candidates"][0]["ai_rmc"] == 11_000
+        assert ollama.generation_calls == 1
+
+        service.run_discovery(db)
+        assert ollama.generation_calls == 1
+
+        observe(10_900, 3)
+        dropped = service.run_discovery(db)
+        assert dropped["candidates"] == []
+        assert service.get_status(db)["candidate_count"] == 0
+        assert service.list_analyzed_candidates(db)[0]["archive_reason"] == "growth_below_threshold"
+
+        observe(12_000, 4)
+        requalified = service.run_discovery(db)
+        assert [candidate["token_id"] for candidate in requalified["candidates"]] == [token.id]
+        assert ollama.generation_calls == 2
+
+        assert service.remove_candidate(db, token.id)
+        observe(15_000, 5)
+        manually_excluded = service.run_discovery(db)
+        assert manually_excluded["candidates"] == []
+        assert ollama.generation_calls == 2
+
+
+def test_stale_ai_baseline_does_not_override_tracked_growth_eligibility() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="BNB Chain", chain_slug="bnb", chain_id="56")
+        db.add(chain)
+        db.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="stale-ai-baseline",
+            normalized_address="stale-ai-baseline",
+            first_seen_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        db.add(token)
+        db.flush()
+        now = datetime.now(timezone.utc)
+        db.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=now - timedelta(minutes=5),
+                market_cap=8_716.72,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=now,
+                market_cap=8_723.46,
+            ),
+            AIIntelligenceRecord(
+                token_id=token.id,
+                record_type="ai_discovery_baseline",
+                source="ai_discovery",
+                manually_entered=False,
+                data={"ai_rmc": 8_723.46, "ai_rh": 8_723.46},
+            ),
+            AIIntelligenceRecord(
+                token_id=token.id,
+                record_type="ai_discovery_candidate",
+                source="ai_discovery",
+                manually_entered=False,
+                data={"run_id": "old-run", "rank": 1, "token_id": token.id, "score": 58},
+            ),
+        ])
+        db.commit()
+
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        result = service.run_discovery(db, use_model=False)
+
+        assert result["candidates"] == []
+        excluded = db.query(AIIntelligenceRecord).filter_by(
+            token_id=token.id,
+            record_type="ai_discovery_exclusion",
+        ).one()
+        assert excluded.data["reason"] == "growth_below_threshold"
+
+
+def test_status_hides_saved_candidate_that_no_longer_meets_growth_gate() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="BNB Chain", chain_slug="bnb", chain_id="56")
+        db.add(chain)
+        db.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="status-growth-gate",
+            normalized_address="status-growth-gate",
+            first_seen_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        db.add(token)
+        db.flush()
+        now = datetime.now(timezone.utc)
+        db.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=now - timedelta(minutes=5),
+                market_cap=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=now,
+                market_cap=10_900,
+            ),
+            AIIntelligenceRecord(
+                token_id=token.id,
+                record_type="ai_discovery_candidate",
+                source="ai_discovery",
+                manually_entered=False,
+                data={
+                    "token_id": token.id,
+                    "run_id": "saved-run",
+                    "rank": 1,
+                    "score": 80,
+                    "heuristic_score": 80,
+                    "growth_percent": 20,
+                    "growth_multiple": 1.2,
+                    "market_cap": 12_000,
+                    "last_run_at": now.isoformat(),
+                },
+            ),
+        ])
+        db.commit()
+
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        stale_status = service.get_status(db)
+        assert stale_status["candidate_count"] == 0
+        assert stale_status["candidates"] == []
+
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            observed_at=now + timedelta(seconds=1),
+            market_cap=12_000,
+        ))
+        db.commit()
+
+        recovered_status = service.get_status(db)
+        assert recovered_status["candidate_count"] == 1
+        assert round(recovered_status["candidates"][0]["growth_percent"], 2) == 20
+        assert recovered_status["candidates"][0]["market_cap"] == 12_000
 
 
 def test_airmc_feedback_and_top_pick_lifecycle_are_persisted() -> None:
@@ -369,43 +763,62 @@ def test_airmc_feedback_and_top_pick_lifecycle_are_persisted() -> None:
 
         service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
         first = service.run_discovery(db, use_model=False)
-        original_ai_rmc = first["candidates"][0]["ai_rmc"]
-        assert original_ai_rmc == 5_100
-        assert first["candidates"][0]["ai_rh"] == original_ai_rmc
+        assert first["candidates"] == []
+        assert db.query(AIIntelligenceRecord).filter_by(
+            token_id=token.id,
+            record_type="ai_discovery_baseline",
+        ).count() == 0
 
         service.record_feedback(db, token.id, "positive")
-        db.add(MarketObservation(token_id=token.id, source="test", market_cap=5_200, liquidity=10_000))
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            observed_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            market_cap=6_000,
+            liquidity=10_000,
+        ))
         db.commit()
         second = service.run_discovery(db, use_model=False)
-        assert second["candidates"][0]["ai_rmc"] == original_ai_rmc
-        assert second["candidates"][0]["ai_rh"] == 5_200
+        assert second["candidates"][0]["ai_rh"] == 6_000
+        original_ai_rmc = second["candidates"][0]["ai_rmc"]
+        assert original_ai_rmc == 6_000
         assert second["candidates"][0]["feedback"] == "positive"
         assert second["candidates"][0]["score"] == (
             second["candidates"][0]["heuristic_score"]
             + second["candidates"][0]["feedback_adjustment"]
             + second["candidates"][0]["continuation_adjustment"]
         )
-        assert second["candidates"][0]["continuation_adjustment"] > 0
-        assert len(second["top_picks"]) == 1
-        assert second["top_picks"][0]["ai_rmc"] == original_ai_rmc
-        assert second["top_picks"][0]["t_rmc"] == 5_200
-        assert second["top_picks"][0]["t_rh"] == 5_200
+        assert second["candidates"][0]["continuation_adjustment"] == 0
+        assert second["top_picks"] == []
 
-        db.add(MarketObservation(token_id=token.id, source="test", market_cap=8_000, liquidity=10_000))
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            observed_at=datetime.now(timezone.utc) + timedelta(seconds=2),
+            market_cap=8_000,
+            liquidity=10_000,
+        ))
         db.commit()
         third = service.run_discovery(db, use_model=False)
+        assert third["candidates"][0]["continuation_adjustment"] > 0
         assert len(third["top_picks"]) == 1
         assert third["top_picks"][0]["ai_rmc"] == original_ai_rmc
         assert third["top_picks"][0]["ai_rh"] == 8_000
-        assert third["top_picks"][0]["t_rmc"] == 5_200
+        assert third["top_picks"][0]["t_rmc"] == 8_000
         assert third["top_picks"][0]["t_rh"] == 8_000
         assert third["top_picks"][0]["ai_growth_multiple"] > 1
 
-        db.add(MarketObservation(token_id=token.id, source="test", market_cap=9_000, liquidity=10_000))
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            observed_at=datetime.now(timezone.utc) + timedelta(seconds=3),
+            market_cap=9_000,
+            liquidity=10_000,
+        ))
         db.commit()
         refreshed_market = service.get_status(db)["top_picks"][0]
         assert refreshed_market["market_cap"] == 9_000
-        assert refreshed_market["t_rmc"] == 5_200
+        assert refreshed_market["t_rmc"] == 8_000
         assert refreshed_market["t_rh"] == 9_000
 
         latest_candidate = db.query(AIIntelligenceRecord).filter_by(
@@ -420,7 +833,7 @@ def test_airmc_feedback_and_top_pick_lifecycle_are_persisted() -> None:
         active_pick.data = {key: value for key, value in active_pick.data.items() if key != "ai_rh"}
         db.commit()
         refreshed = service.get_status(db)
-        assert refreshed["candidates"][0]["ai_rh"] == 8_000
+        assert refreshed["candidates"][0]["ai_rh"] == 9_000
         assert refreshed["top_picks"][0]["ai_rh"] == 9_000
 
         assert service.remove_top_pick(db, token.id)
@@ -531,6 +944,7 @@ def test_automatic_feedback_tracks_airmc_drawdown_and_three_x_high() -> None:
         db.add(chain)
         db.flush()
         token = Token(chain_id=chain.id, contract_address="outcome", normalized_address="outcome")
+        token.first_seen_at = datetime.now(timezone.utc) - timedelta(days=1)
         db.add(token)
         db.flush()
         observed_at = datetime.now(timezone.utc)
@@ -541,7 +955,14 @@ def test_automatic_feedback_tracks_airmc_drawdown_and_three_x_high() -> None:
             manually_entered=False,
             data={"ai_rmc": 5_000},
         )
-        db.add(baseline)
+        prior_candidate = AIIntelligenceRecord(
+            token_id=token.id,
+            record_type="ai_discovery_candidate",
+            source="ai_discovery",
+            manually_entered=False,
+            data={"run_id": "prior-run", "rank": 1, "token_id": token.id, "score": 55},
+        )
+        db.add_all([baseline, prior_candidate])
         db.flush()
         db.add_all([
             MarketObservation(

@@ -1,17 +1,19 @@
 const apiRoot = '/api/v1';
 const pageSize = 100;
 const overviewPageSize = 50;
-const tokenTableColumns = ['chain', 'tokenIdentity', 'address', 'marketCap', 'marketUpdated', 'liquidity', 'holders', 'reachMc', 'reachHigh', 'growthCurrent', 'growthPeak', 'buyers', 'socials', 'firstSeen', 'favorite'];
+const tokenTableColumns = ['chain', 'tokenIdentity', 'address', 'marketCap', 'marketUpdated', 'liquidity', 'holders', 'reachMc', 'reachHigh', 'growthCurrent', 'growthPeak', 'buyers', 'socials', 'firstSeen', 'favorite', 'details'];
 const pageTotalKeys = {
     tokens: 'tokens', followed: 'followed_traders',
     favorites: 'favorites', graduated: 'graduations', risk: 'risk_findings', dismissed: 'dismissed_tokens',
 };
-const searchablePages = new Set(['tokens', 'followed', 'favorites', 'graduated', 'risk', 'dismissed', 'ai', 'analyzed', 'topPicks']);
+const searchablePages = new Set(['tokens', 'followed', 'favorites', 'graduated', 'risk', 'dismissed', 'ai', 'topPicks']);
 const searchCountEndpoints = {
     tokens: '/tokens/count', followed: '/followed-traders/count', favorites: '/favorites/count', graduated: '/graduated-tokens/count',
     risk: '/risk-analysis/count', dismissed: '/dismissed-tokens/count',
 };
-const aiAnalysisColumns = ['aiRank', 'aiTokenIdentity', 'aiDuration', 'favorite', 'aiScore', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiMore'];
+const aiAnalysisColumns = ['aiRank', 'aiTokenIdentity', 'aiDuration', 'favorite', 'aiScore', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiMore', 'aiCandidateRemove'];
+const securityReviewScoreTooltip = 'Security Review combines provider-aware market, holder, wallet/creator, liquidity/lock, and recorded risk-finding data. Risk score is the sum of weighted flags, capped at 100: missing market data +15; market cap above graduation threshold +10; liquidity below minimum +20 and an additional liquidity-risk flag +12; stale market data +15; fewer than 50 holders +10; possible withdrawal +10; risk findings critical +25, high +18, medium +12, low +7, other +5 each; graduated token +10. Confidence is a separate heuristic: 40% + half the risk score, clamped to 15–95% (with the current 0–100 score range, this yields 40–90%). Neither number is a guarantee or a measure of data completeness.';
+const securityReviewConfidenceTooltip = 'Heuristic estimate, not data completeness: 40% + half the risk score, clamped to 15–95%. With a risk score capped at 100, the current range is 40–90%.';
 let followedMonitorStatus = { state: 'disabled', message: null };
 const pageDefinitions = {
     overview: {
@@ -68,15 +70,7 @@ const pageDefinitions = {
         eyebrow: 'RESEARCH SYSTEMS', kicker: 'TRACKED TOKEN ANALYSIS', tableTitle: 'Tracked token candidates',
         endpoint: '/ai-discovery/', emptyTitle: 'No discovery results yet',
         emptyDescription: 'Run an analysis to rank active tokens from The Tokens.',
-        columns: [...aiAnalysisColumns, 'aiDelete'],
-    },
-    analyzed: {
-        title: 'AI Analyzed', breadcrumb: 'AI Analyzed',
-        description: 'Removed candidates with the same analysis columns as AI Discovery.',
-        eyebrow: 'RESEARCH HISTORY', kicker: 'REMOVED CANDIDATES', tableTitle: 'Analyzed tokens',
-        endpoint: '/ai-discovery/analyzed', emptyTitle: 'No analyzed tokens yet',
-        emptyDescription: 'Tokens removed from AI Discovery will appear here.',
-        columns: [...aiAnalysisColumns, 'aiAnalyzedAt'],
+        columns: [...aiAnalysisColumns],
     },
     topPicks: {
         title: 'Top 3 picks', breadcrumb: 'Top 3 picks',
@@ -84,7 +78,7 @@ const pageDefinitions = {
         eyebrow: 'PINNED CANDIDATES', kicker: 'ACTIVE PICKS', tableTitle: 'Top 3 tracked tokens',
         endpoint: '/ai-discovery/', emptyTitle: 'No eligible picks yet',
         emptyDescription: 'Eligible tokens will appear here after an AI discovery scan.',
-        columns: ['aiRank', 'tokenIdentity', 'address', 'marketCap', 'topPickRmc', 'topPickHigh', 'topPickGrowthCurrent', 'topPickGrowthHigh', 'aiScore', 'topPickRemove'],
+        columns: ['aiRank', 'tokenIdentity', 'address', 'marketCap', 'topPickRmc', 'topPickHigh', 'topPickGrowthCurrent', 'topPickGrowthHigh', 'aiScore', 'aiMore', 'topPickRemove'],
     },
     dismissed: {
         title: 'Dismissed tokens', breadcrumb: 'Dismissed',
@@ -136,6 +130,7 @@ const columnDefinitions = {
     buyers: { label: 'FU', title: 'Followed-user buyers (FU)', value: (row) => String(row.buyer_count ?? 0), action: 'buyers' },
     socials: { label: 'Links', title: 'Social links', value: (row) => row.social_links || [], action: 'socials' },
     favorite: { label: 'Fav.', title: 'Favorite', value: (row) => row.is_favorite ? '★' : '☆', action: 'favorite' },
+    details: { label: 'View', title: 'Open token details', value: () => 'View', action: 'token-details' },
     delete: { label: 'Dismiss', title: 'Move token to Dismissed', value: () => '×', action: 'delete' },
     volume: { label: 'Volume', value: (row) => money(row.volume) },
     provider: { label: 'Provider', value: (row) => row.provider_name || row.source || '—' },
@@ -158,9 +153,9 @@ const columnDefinitions = {
         const hours = aiDurationHours(row.ai_discovery_since);
         return hours === null ? '—' : `${String(Math.floor(hours)).padStart(2, '0')}h`;
     } },
+    aiCandidateRemove: { label: 'Remove', title: 'Remove this token from AI Discovery', value: () => '×', action: 'removeAiCandidate' },
     aiAnalyzedAt: { label: 'Removed', title: 'When this candidate was removed from AI Discovery', value: (row) => dateTime(row.ai_analyzed_at) },
-    aiMore: { label: 'Details', title: 'Open analysis, signals, and risks', value: () => 'More', action: 'aiDetails' },
-    aiDelete: { label: 'Remove', title: 'Remove this candidate from AI Discovery only', value: () => '×', action: 'removeAiCandidate' },
+    aiMore: { label: 'Details', title: 'Open analysis, signals, risks, and security review', value: () => 'More', action: 'aiDetails' },
     aiRecommendation: { label: 'Assessment', value: (row) => row.recommendation || 'Review' },
     aiScore: { label: 'Score', title: 'Combined tracked-signal and local-model score from 0 to 100', value: (row) => `${Number(row.score ?? 0).toFixed(1)} / 100` },
     aiGrowth: { label: 'Growth', title: 'Current market cap divided by the original tracked RMC', value: (row) => row.growth_multiple === null || row.growth_multiple === undefined ? '—' : `${Number(row.growth_multiple).toFixed(2)}×` },
@@ -224,6 +219,10 @@ const columnDefinitions = {
     status: { label: 'Status', value: (row) => row.is_graduated ? 'Graduated' : 'Tracking', badge: true, toneFrom: (row) => row.is_graduated ? 'positive' : 'tracking' },
     reason: { label: 'Reason', value: (row) => row.reason || 'Not specified' },
     restored: { label: 'Review state', value: (row) => row.restored ? 'Restored' : 'Dismissed', badge: true, toneFrom: (row) => row.restored ? 'positive' : 'pending' },
+    riskScore: { label: 'Risk score', value: (row) => row.risk_score != null ? `${Number(row.risk_score).toFixed(0)}/100` : '—', badge: true, toneFrom: (row) => Number(row.risk_score || 0) >= 80 ? 'critical' : Number(row.risk_score || 0) >= 60 ? 'warning' : Number(row.risk_score || 0) >= 35 ? 'pending' : 'positive' },
+    riskLevel: { label: 'Risk', value: (row) => (row.risk_level || 'unverified').toString().replace(/_/g, ' '), badge: true, toneFrom: (row) => String(row.risk_level || 'unverified') },
+    liquidityStatus: { label: 'Liquidity', value: (row) => row.liquidity_security?.status || row.liquidity_status || 'unverified', badge: true, toneFrom: (row) => String(row.liquidity_security?.status || row.liquidity_status || 'unverified') },
+    lastAnalyzed: { label: 'Last checked', value: (row) => dateTime(row.last_analyzed_at || row.created_at) },
 };
 
 const elements = {
@@ -283,7 +282,7 @@ function selectedRowIds(page = activePage) {
 }
 
 function rowSelectionId(row, page = activePage) {
-    return ['graduated', 'risk'].includes(page) ? row.token_id : row.id;
+    return ['graduated', 'risk', 'ai', 'topPicks'].includes(page) ? (row.token_id ?? row.id) : row.id;
 }
 
 function chainLabel(value) {
@@ -652,7 +651,16 @@ function renderTable(rows, keys) {
                 const ticker = document.createElement('small');
                 ticker.textContent = row.ticker || row.contract_address || 'Name unavailable';
                 ticker.title = ticker.textContent;
-                copy.append(name, ticker);
+                const aiBadgeVisible = row.has_ai_discovery_history || row.ai_discovery_since || row.ai_candidate || row.is_ai_candidate || row.ai_rank != null || row.is_top_pick || (activePage === 'topPicks' && row.rank != null);
+                if (aiBadgeVisible) {
+                    const badge = document.createElement('span');
+                    badge.className = 'token-ai-badge';
+                    badge.textContent = 'AI';
+                    badge.title = 'This token has appeared in AI Discovery';
+                    copy.append(name, ticker, badge);
+                } else {
+                    copy.append(name, ticker);
+                }
                 identity.append(copy);
                 cell.append(identity);
             } else if (column.icon === 'chain') {
@@ -740,6 +748,16 @@ function renderTable(rows, keys) {
                     button.setAttribute('aria-label', `Add ${row.ticker || row.name || 'token'} to favorites`);
                     cell.append(button);
                 }
+            } else if (column.action === 'token-details') {
+                const button = document.createElement('button');
+                button.className = 'text-button';
+                button.type = 'button';
+                button.dataset.action = 'token-details';
+                button.dataset.tokenId = String(row.token_id ?? row.id);
+                button.textContent = value;
+                button.title = column.title;
+                button.setAttribute('aria-label', `Open ${row.ticker || row.name || 'token'} details`);
+                cell.append(button);
             } else if (column.action === 'delete') {
                 const dismissRiskToken = activePage === 'risk';
                 const deleteToken = ['overview', 'tokens', 'graduated'].includes(activePage);
@@ -1162,8 +1180,77 @@ function openEntryDialog() {
     elements.dialog.showModal();
 }
 
-function openAiDetails(candidate) {
+function renderAiSecuritySummary(payload, target) {
+    if (!target) return;
+    const riskScore = Number(payload?.risk_score ?? 0);
+    const confidence = payload?.confidence != null ? Math.round(Number(payload.confidence) * 100) : 0;
+    const liquidity = payload?.liquidity_security || {};
+    const holder = payload?.holder_concentration || {};
+    const creator = payload?.creator_wallet_cluster || {};
+    const activity = payload?.creator_activity || {};
+    const riskTone = riskScore >= 80 ? 'critical' : riskScore >= 60 ? 'warning' : riskScore >= 35 ? 'pending' : 'positive';
+    const riskLabel = payload?.risk_level || 'unverified';
+    const formatMoney = (value) => {
+        if (value === null || value === undefined || value === '') return '—';
+        const amount = Number(value);
+        if (!Number.isFinite(amount)) return String(value);
+        return `$${new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(amount)}`;
+    };
+    const formatPercent = (value) => {
+        if (value === null || value === undefined || value === '') return '—';
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return String(value);
+        return `${numeric}%`;
+    };
+    const largestHolder = holder.largest_holder || holder.largest_holder_address || creator.largest_holder_address || activity.creator_address || '—';
+    const creatorWalletCount = creator.connected_wallet_count ?? holder.creator_linked_cluster_wallets ?? '—';
+    const combinedHoldings = creator.combined_percentage_of_supply ?? holder.combined_cluster_holdings ?? holder.combined_cluster_holdings_percent ?? null;
+    const soldSupply = activity.tokens_sold_percent_supply ?? activity.total_tokens_sold ?? activity.creator_sold_percentage ?? null;
+    const transferredSupply = activity.tokens_transferred_percent_supply ?? activity.total_tokens_transferred ?? null;
+    const creatorRemaining = activity.creator_remaining_percent_supply ?? activity.creator_remaining_percentage ?? null;
+
+    target.innerHTML = `
+        <div class="security-review-overview">
+            <div class="security-review-score security-review-score--${riskTone}">
+                <span class="security-review-badge">${riskLabel}</span>
+                <div class="security-review-number" title="${securityReviewScoreTooltip}" tabindex="0" aria-label="Security risk score out of 100. Hover or focus for calculation details.">${payload?.risk_score ?? '—'}<small>/100</small></div>
+                <div class="security-review-meta" title="${securityReviewConfidenceTooltip}">${confidence}% confidence</div>
+            </div>
+            <div class="security-review-metrics">
+                <div class="security-metric"><span>Market cap</span><strong>${formatMoney(payload?.market_summary?.market_cap)}</strong></div>
+                <div class="security-metric"><span>Liquidity</span><strong>${formatMoney(payload?.market_summary?.liquidity)}</strong></div>
+                <div class="security-metric"><span>Top 5</span><strong>${holder.top_5_percent != null ? `${holder.top_5_percent}%` : '—'}</strong></div>
+                <div class="security-metric"><span>LP lock</span><strong>${liquidity.lock_verification?.status || 'unverified'}</strong></div>
+            </div>
+        </div>
+        <div class="security-review-grid">
+            <section class="security-review-panel">
+                <h3>Liquidity</h3>
+                <div class="security-review-row"><span>Status</span><strong>${liquidity.status || 'unverified'}</strong></div>
+                <div class="security-review-row"><span>Lock</span><strong>${liquidity.lock_verification?.status || (liquidity.lp_lock_verified ? 'verified' : 'unverified')}</strong></div>
+                <div class="security-review-row"><span>Withdrawal risk</span><strong>${liquidity.lock_verification?.can_potentially_withdraw ? 'Potentially' : 'Not evident'}</strong></div>
+            </section>
+            <section class="security-review-panel">
+                <h3>Creator activity</h3>
+                <div class="security-review-row"><span>Tokens sold</span><strong>${soldSupply != null ? `${soldSupply}% supply` : '—'}</strong></div>
+                <div class="security-review-row"><span>Tokens transferred</span><strong>${transferredSupply != null ? `${transferredSupply}% supply` : '—'}</strong></div>
+                <div class="security-review-row"><span>Creator remaining</span><strong>${creatorRemaining != null ? `${creatorRemaining}% supply` : '—'}</strong></div>
+            </section>
+            <section class="security-review-panel">
+                <h3>Holder distribution</h3>
+                <div class="security-review-row"><span>Largest holder</span><strong>${largestHolder}</strong></div>
+                <div class="security-review-row"><span>Top 10 holding (Fomo Family)</span><strong>${formatPercent(holder.top_10_percent)}</strong></div>
+                <div class="security-review-row"><span>Creator-linked cluster</span><strong>${creatorWalletCount === '—' ? '—' : `${creatorWalletCount} wallets`}</strong></div>
+                <div class="security-review-row"><span>Combined cluster holdings</span><strong>${formatPercent(combinedHoldings)}</strong></div>
+            </section>
+        </div>
+    `;
+}
+
+async function openAiDetails(candidate) {
     const dialog = document.getElementById('ai-details-dialog');
+    const securityTarget = document.getElementById('ai-details-security');
+    const tokenId = candidate?.token_id ?? candidate?.id;
     document.getElementById('ai-details-title').textContent = candidate.name || candidate.ticker || 'AI candidate';
     document.getElementById('ai-details-ticker').textContent = candidate.ticker || 'Ticker unavailable';
     document.getElementById('ai-details-analysis').textContent = candidate.summary || 'No analysis available.';
@@ -1171,7 +1258,128 @@ function openAiDetails(candidate) {
         ? candidate.strengths.join(' · ') : 'No tracked signals listed.';
     document.getElementById('ai-details-risks').textContent = Array.isArray(candidate.risks) && candidate.risks.length
         ? candidate.risks.join(' · ') : 'No tracked risks listed.';
+    securityTarget.innerHTML = '<p class="cell-muted">Loading security review…</p>';
     dialog.showModal();
+
+    if (!tokenId) return;
+    try {
+        let payload = await fetchJson(`/security/${tokenId}`);
+        if (!payload || !payload.risk_score) {
+            payload = await fetchJson(`/security/${tokenId}/analyze`, { method: 'POST' });
+        }
+        renderAiSecuritySummary(payload, securityTarget);
+    } catch (error) {
+        securityTarget.innerHTML = `<p class="cell-muted">${error instanceof Error ? error.message : 'Security review unavailable for this token.'}</p>`;
+    }
+}
+
+function renderSecurityDetails(payload) {
+    const body = document.getElementById('security-details-body');
+    const tokenLabel = document.getElementById('security-details-token');
+    const tokenName = payload?.token_name || payload?.token?.name || payload?.name || 'Token';
+    const ticker = payload?.ticker || payload?.token?.ticker || '';
+    tokenLabel.textContent = ticker ? `${tokenName} (${ticker})` : tokenName;
+
+    const issues = Array.isArray(payload?.risk_findings) && payload.risk_findings.length
+        ? payload.risk_findings.map((item) => `• ${item.summary || item.category || 'Finding'} (${item.severity || 'unknown'})`).join('\n')
+        : 'No specific findings recorded.';
+
+    const creator = payload?.creator_wallet_cluster || {};
+    const liquidity = payload?.liquidity_security || {};
+    const market = payload?.market_summary || {};
+    const metadata = payload?.analysis_metadata || {};
+    const holder = payload?.holder_concentration || {};
+    const activity = payload?.creator_activity || {};
+    const provider = payload?.analysis_metadata?.provider_status || {};
+    const riskScore = Number(payload?.risk_score ?? 0);
+    const confidence = payload?.confidence != null ? Math.round(Number(payload.confidence) * 100) : 0;
+    const riskTone = riskScore >= 80 ? 'critical' : riskScore >= 60 ? 'warning' : riskScore >= 35 ? 'pending' : 'positive';
+    const liquidityStatus = String(liquidity.status || 'unverified');
+    const formatMoney = (value) => {
+        if (value === null || value === undefined || value === '') return '—';
+        const amount = Number(value);
+        if (!Number.isFinite(amount)) return String(value);
+        return `$${formatNumber(amount)}`;
+    };
+    const formatPercent = (value) => {
+        if (value === null || value === undefined || value === '') return '—';
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return String(value);
+        return `${numeric}%`;
+    };
+    const formatNumber = (value) => new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(Number(value));
+    const riskLabel = payload?.risk_level || 'unverified';
+    const largestHolder = holder.largest_holder || holder.largest_holder_address || creator.largest_holder_address || activity.creator_address || '—';
+    const creatorWalletCount = creator.connected_wallet_count ?? holder.creator_linked_cluster_wallets ?? '—';
+    const combinedHoldings = creator.combined_percentage_of_supply ?? holder.combined_cluster_holdings ?? holder.combined_cluster_holdings_percent ?? null;
+    const soldSupply = activity.tokens_sold_percent_supply ?? activity.total_tokens_sold ?? activity.creator_sold_percentage ?? null;
+    const transferredSupply = activity.tokens_transferred_percent_supply ?? activity.total_tokens_transferred ?? null;
+    const creatorRemaining = activity.creator_remaining_percent_supply ?? activity.creator_remaining_percentage ?? null;
+
+    body.innerHTML = `
+        <div class="security-review-overview">
+            <div class="security-review-score security-review-score--${riskTone}">
+                <span class="security-review-badge">${riskLabel}</span>
+                <div class="security-review-number" title="${securityReviewScoreTooltip}" tabindex="0" aria-label="Security risk score out of 100. Hover or focus for calculation details.">${payload?.risk_score ?? '—'}<small>/100</small></div>
+                <div class="security-review-meta" title="${securityReviewConfidenceTooltip}">${confidence}% confidence</div>
+            </div>
+            <div class="security-review-metrics">
+                <div class="security-metric"><span>Market cap</span><strong>${formatMoney(market.market_cap)}</strong></div>
+                <div class="security-metric"><span>Liquidity</span><strong>${formatMoney(market.liquidity)}</strong></div>
+                <div class="security-metric"><span>Price</span><strong>${market.price != null ? `$${Number(market.price).toLocaleString(undefined, { maximumFractionDigits: 6 })}` : '—'}</strong></div>
+                <div class="security-metric"><span>Provider</span><strong>${provider?.provider_name || provider?.mode || provider?.chain_adapter || 'local_db'}</strong></div>
+            </div>
+        </div>
+        <div class="security-review-grid">
+            <section class="security-review-panel">
+                <h3>Liquidity / lock</h3>
+                <div class="security-review-row"><span>Status</span><strong>${liquidityStatus}</strong></div>
+                <div class="security-review-row"><span>LP lock</span><strong>${liquidity.lock_verification?.status || (liquidity.lp_lock_verified ? 'verified' : 'unverified')}</strong></div>
+                <div class="security-review-row"><span>Lock contract</span><strong>${liquidity.lock_contract || liquidity.lock_verification?.lock_contract || '—'}</strong></div>
+                <div class="security-review-row"><span>Withdrew path</span><strong>${liquidity.can_potentially_withdraw || liquidity.lock_verification?.can_potentially_withdraw ? 'Potentially' : 'Not evident'}</strong></div>
+            </section>
+            <section class="security-review-panel">
+                <h3>Creator activity</h3>
+                <div class="security-review-row"><span>Tokens sold</span><strong>${soldSupply != null ? `${soldSupply}% supply` : '—'}</strong></div>
+                <div class="security-review-row"><span>Tokens transferred</span><strong>${transferredSupply != null ? `${transferredSupply}% supply` : '—'}</strong></div>
+                <div class="security-review-row"><span>Creator remaining</span><strong>${creatorRemaining != null ? `${creatorRemaining}% supply` : '—'}</strong></div>
+            </section>
+            <section class="security-review-panel">
+                <h3>Holder distribution</h3>
+                <div class="security-review-row"><span>Largest holder</span><strong>${largestHolder}</strong></div>
+                <div class="security-review-row"><span>Top 10 holding (Fomo Family)</span><strong>${formatPercent(holder.top_10_percent)}</strong></div>
+                <div class="security-review-row"><span>Creator-linked cluster</span><strong>${creatorWalletCount === '—' ? '—' : `${creatorWalletCount} wallets`}</strong></div>
+                <div class="security-review-row"><span>Combined cluster holdings</span><strong>${formatPercent(combinedHoldings)}</strong></div>
+            </section>
+            <section class="security-review-panel security-review-panel--wide">
+                <h3>Risk findings</h3>
+                <pre>${issues}</pre>
+            </section>
+        </div>
+    `;
+}
+
+async function openSecurityDetails(tokenId) {
+    const dialog = document.getElementById('security-details-dialog');
+    const body = document.getElementById('security-details-body');
+    body.innerHTML = '<p>Loading security review…</p>';
+    dialog.showModal();
+    try {
+        let payload = await fetchJson(`/security/${tokenId}`);
+        if (!payload || !payload.token_id) {
+            payload = await fetchJson(`/security/${tokenId}/analyze`, { method: 'POST' });
+        }
+        document.getElementById('security-details-title').textContent = payload?.token_name || payload?.name || 'Token security';
+        renderSecurityDetails(payload);
+    } catch (error) {
+        try {
+            const generated = await fetchJson(`/security/${tokenId}/analyze`, { method: 'POST' });
+            document.getElementById('security-details-title').textContent = generated?.token_name || generated?.name || 'Token security';
+            renderSecurityDetails(generated);
+        } catch (retryError) {
+            body.innerHTML = `<p class="cell-muted">${retryError instanceof Error ? retryError.message : 'Unable to load security details.'}</p>`;
+        }
+    }
 }
 
 elements.nav.addEventListener('click', (event) => {
@@ -1306,6 +1514,10 @@ elements.tableBody.addEventListener('click', async (event) => {
         }
         return;
     }
+    if (button.dataset.action === 'token-details') {
+        await openSecurityDetails(Number(tokenId || button.dataset.tokenId));
+        return;
+    }
     if (button.dataset.action === 'buyers') {
         const dialog = document.getElementById('buyer-dialog');
         const list = document.getElementById('buyer-list');
@@ -1403,6 +1615,8 @@ elements.primaryAction.addEventListener('click', openEntryDialog);
 document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => elements.dialog.close()));
 document.querySelector('[data-close-buyers]').addEventListener('click', () => document.getElementById('buyer-dialog').close());
 document.querySelector('[data-close-ai-details]').addEventListener('click', () => document.getElementById('ai-details-dialog').close());
+const securityDialogClose = document.querySelector('[data-close-security-details]');
+if (securityDialogClose) securityDialogClose.addEventListener('click', () => document.getElementById('security-details-dialog').close());
 elements.dialog.addEventListener('click', (event) => {
     if (event.target === elements.dialog) elements.dialog.close();
 });

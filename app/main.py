@@ -25,6 +25,7 @@ from app.features.market_data.routes import router as market_data_router
 from app.features.risk_analysis.routes import router as risk_router
 from app.features.ai_discovery.routes import router as ai_discovery_router
 from app.features.dismissed_tokens.routes import router as dismissed_tokens_router
+from app.features.security_analysis.routes import router as security_router
 from app.features.tokens.routes import router as tokens_router
 from app.models import MarketObservation
 
@@ -60,6 +61,10 @@ async def lifespan(app: FastAPI):
         _run_ai_discovery(),
         name="ai-discovery-refresh",
     )
+    security_analysis_task = asyncio.create_task(
+        _run_security_analysis(),
+        name="security-analysis-refresh",
+    )
     monitor = None
     app.state.fomo_activity_monitor = None
     if settings.fomo_activity_monitor_enabled:
@@ -83,7 +88,8 @@ async def lifespan(app: FastAPI):
         logger.info("Application shutdown requested")
         market_refresh_task.cancel()
         ai_discovery_task.cancel()
-        await asyncio.gather(market_refresh_task, ai_discovery_task, return_exceptions=True)
+        security_analysis_task.cancel()
+        await asyncio.gather(market_refresh_task, ai_discovery_task, security_analysis_task, return_exceptions=True)
         if monitor is not None:
             await monitor.stop()
 
@@ -98,6 +104,12 @@ async def _run_ai_discovery() -> None:
     from app.workers.ai_discovery import run_ai_discovery
 
     await run_ai_discovery(settings.ai_discovery_interval_seconds)
+
+
+async def _run_security_analysis() -> None:
+    from app.workers.security_analysis import run_security_analysis
+
+    await run_security_analysis(settings.security_analysis_interval_seconds, settings.security_analysis_batch_size)
 
 
 app = FastAPI(
@@ -124,6 +136,7 @@ app.include_router(graduated_tokens_router, prefix="/api/v1")
 app.include_router(dismissed_tokens_router, prefix="/api/v1")
 app.include_router(risk_router, prefix="/api/v1")
 app.include_router(ai_discovery_router, prefix="/api/v1")
+app.include_router(security_router, prefix="/api/v1")
 app.include_router(tokens_router, prefix="/api/v1")
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")

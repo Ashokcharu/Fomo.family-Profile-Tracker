@@ -10,6 +10,7 @@ from app.models import (
     FollowedTrader,
     GraduationEvent,
     RiskFinding,
+    SecurityAnalysis,
     Token,
     TraderTransactionEvent,
 )
@@ -28,6 +29,7 @@ def get_overview(db: Session) -> dict:
         "favorites": db.query(Favorite).count(),
         "graduations": db.query(GraduationEvent).count(),
         "risk_findings": db.query(RiskFinding).count(),
+        "security_analyses": db.query(SecurityAnalysis).count(),
         "dismissed_tokens": db.query(DismissedToken).count(),
         "status": "ok",
         "last_successful_refresh": "not yet run",

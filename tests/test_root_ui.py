@@ -20,6 +20,11 @@ def test_root_serves_html_ui() -> None:
     assert "let deleteRowsInProgress = false" in app_script.text
     assert "deleteRowsInProgress = false;" in app_script.text
     assert "label: 'FH', title: 'Fomo holders (FH)'" in app_script.text
+    assert "row.has_ai_discovery_history" in app_script.text
+    assert "className = 'token-ai-badge'" in app_script.text
+    assert "confidence}% confidence • ${metadata?.phase" not in app_script.text
+    assert "Security Review combines provider-aware market" in app_script.text
+    assert "Heuristic estimate, not data completeness" in app_script.text
     assert "multiple.toFixed" not in app_script.text
 
     health = client.get('/api/v1/health')
