@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import get_db
 from app.features.tokens.service import active_token_count, create_or_get_token, delete_token, delete_tokens, list_recent_bought_tokens, list_token_buyers, list_tokens
-from app.models import Token
+from app.models import Favorite, Token
 
 router = APIRouter(prefix="/tokens", tags=["tokens"])
 
@@ -53,7 +53,13 @@ def get_token_buyers(token_id: int, db: Session = Depends(get_db)) -> list[dict]
 @router.post("/")
 def add_token(chain_name: str, address: str, db: Session = Depends(get_db)) -> dict:
     token = create_or_get_token(db, chain_name, address)
-    return {"id": token.id, "chain_id": token.chain_id, "normalized_address": token.normalized_address}
+    is_favorite = db.query(Favorite.id).filter(Favorite.token_id == token.id).first() is not None
+    return {
+        "id": token.id,
+        "chain_id": token.chain_id,
+        "normalized_address": token.normalized_address,
+        "is_favorite": is_favorite,
+    }
 
 
 @router.delete("/bulk-delete")

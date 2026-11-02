@@ -23,20 +23,29 @@ def test_helius_keys_rotate_without_duplicates() -> None:
 
 
 def test_helius_token_holder_metadata_is_normalized(monkeypatch) -> None:
+    calls = []
+
     def fake_post(url, json, timeout):
+        calls.append(json)
+
         class Response:
             def raise_for_status(self):
                 return None
 
             def json(self):
+                if json["method"] == "getTokenSupply":
+                    return {"result": {"value": {
+                        "amount": "200000000",
+                        "decimals": 6,
+                        "uiAmount": 200,
+                    }}}
                 return {
                     "result": {
                         "value": [
-                            {"address": "A", "amount": "100", "uiAmount": 100},
-                            {"address": "B", "amount": "60", "uiAmount": 60},
-                            {"address": "C", "amount": "40", "uiAmount": 40},
+                            {"address": "A", "amount": "100000000", "decimals": 6, "uiAmount": 100},
+                            {"address": "B", "amount": "60000000", "decimals": 6, "uiAmount": 60},
+                            {"address": "C", "amount": "40000000", "decimals": 6, "uiAmount": 40},
                         ],
-                        "total_supply": 200,
                     }
                 }
 
@@ -47,8 +56,13 @@ def test_helius_token_holder_metadata_is_normalized(monkeypatch) -> None:
     result = client.fetch_token_holders("mint-1", limit=10)
 
     assert result["status"] == "ok"
-    assert result["holder_count"] == 3
+    assert result["holder_count"] is None
+    assert result["returned_account_count"] == 3
     assert result["top_5_percentage"] == 100.0
+    assert result["top_10_percentage"] == 100.0
+    assert result["concentration_basis"] == "top_token_accounts_as_share_of_total_supply"
+    assert calls[0]["params"] == ["mint-1", {"commitment": "confirmed"}]
+    assert calls[1]["params"] == ["mint-1", {"commitment": "confirmed"}]
 
 
 def test_manual_followed_user_add_is_deduped() -> None:

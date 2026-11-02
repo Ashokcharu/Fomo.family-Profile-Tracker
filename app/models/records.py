@@ -95,6 +95,72 @@ class MarketObservation(Base):
     token: Mapped[Token] = relationship(back_populates="market_observations")
 
 
+class AIDiscoverySnapshot(Base):
+    __tablename__ = "ai_discovery_snapshots"
+    __table_args__ = (
+        UniqueConstraint("run_id", "token_id", name="uq_ai_discovery_snapshot_run_token"),
+        Index("ix_ai_discovery_snapshots_captured", "captured_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    signal_score: Mapped[float] = mapped_column(Float, nullable=False)
+    market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    data_completeness: Mapped[float] = mapped_column(Float, nullable=False)
+    market_data_source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    market_data_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    risk_assessment: Mapped[JSON | None] = mapped_column(JSON, nullable=True)
+    signal_features: Mapped[JSON | None] = mapped_column(JSON, nullable=True)
+
+    token: Mapped[Token] = relationship()
+
+
+class AIDiscoveryOutcome(Base):
+    __tablename__ = "ai_discovery_outcomes"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "horizon_hours", name="uq_ai_discovery_outcome_horizon"),
+        Index("ix_ai_discovery_outcomes_snapshot", "snapshot_id"),
+        Index("ix_ai_discovery_outcomes_target", "target_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("ai_discovery_snapshots.id"), nullable=False)
+    horizon_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_return_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AIDiscoveryModelAssessment(Base):
+    __tablename__ = "ai_discovery_model_assessments"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", name="uq_ai_discovery_model_assessment_snapshot"),
+        Index("ix_ai_discovery_model_assessments_assessed", "assessed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("ai_discovery_snapshots.id"), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    review: Mapped[JSON | None] = mapped_column(JSON, nullable=True)
+    assessment_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    assessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class FollowedTrader(Base):
     __tablename__ = "followed_traders"
 

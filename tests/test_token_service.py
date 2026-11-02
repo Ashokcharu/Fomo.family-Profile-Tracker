@@ -157,6 +157,35 @@ def test_create_or_get_token_prevents_duplicate_chain_identity() -> None:
         assert session.query(type(first)).count() == 1
 
 
+def test_robinhood_manual_add_reuses_existing_network_token() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        network_chain = Chain(
+            chain_name="Fomo network 4663",
+            chain_slug="fomo_network_4663",
+            chain_id="4663",
+        )
+        alias_chain = Chain(chain_name="robinhood", chain_slug="robinhood")
+        session.add_all([network_chain, alias_chain])
+        session.flush()
+        existing = Token(
+            chain_id=network_chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+        )
+        session.add(existing)
+        session.flush()
+        session.add(Favorite(token_id=existing.id))
+        session.commit()
+
+        added = create_or_get_token(session, "robinhood", "0xABC")
+
+        assert added.id == existing.id
+        assert session.query(Token).count() == 1
+        assert list_tokens(session) == []
+
+
 def test_token_rows_include_metrics_buyers_and_favorite_hides_them() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -570,7 +599,11 @@ def test_dismissing_risk_token_preserves_history_and_removes_active_findings() -
 
         result = dismiss_tokens(session, [token.id, second_token.id, token.id], reason="Risk review")
 
-        assert result == {"dismissed": 2, "risk_findings_deleted": 2}
+        assert result == {
+            "dismissed": 2,
+            "risk_findings_deleted": 2,
+            "security_analyses_deleted": 0,
+        }
         assert session.query(Token).filter_by(id=token.id).one()
         assert session.query(MarketObservation).filter_by(token_id=token.id).count() == 1
         assert session.query(RiskFinding).filter_by(token_id=token.id).count() == 0
@@ -579,5 +612,9 @@ def test_dismissing_risk_token_preserves_history_and_removes_active_findings() -
         assert active_token_count(session) == 0
         assert active_dismissed_token_ids(session) == {token.id, second_token.id}
 
-        assert dismiss_tokens(session, [token.id]) == {"dismissed": 0, "risk_findings_deleted": 0}
+        assert dismiss_tokens(session, [token.id]) == {
+            "dismissed": 0,
+            "risk_findings_deleted": 0,
+            "security_analyses_deleted": 0,
+        }
         assert count_dismissed_tokens(session) == 2

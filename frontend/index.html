@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#17251f" />
+    <meta name="theme-color" content="#0b1117" />
     <title>FomoProfleTracker | Onchain intelligence</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -60,6 +60,30 @@
                 </section>
 
                 <section class="metric-grid" id="metric-grid" aria-label="Workspace metrics" aria-live="polite"></section>
+
+                <section class="evaluation-panel" id="ai-evaluation-panel" aria-labelledby="ai-evaluation-title" hidden>
+                    <div class="evaluation-heading">
+                        <div>
+                            <div class="section-kicker">PHASE 3 · HISTORICAL EVALUATION</div>
+                            <h2 id="ai-evaluation-title">Strategy comparison</h2>
+                            <p id="ai-evaluation-note"></p>
+                        </div>
+                    </div>
+                    <div class="evaluation-table-scroll">
+                        <table class="evaluation-table" aria-label="AI Discovery strategy outcomes">
+                            <thead>
+                                <tr>
+                                    <th scope="col">Horizon</th>
+                                    <th scope="col">Signal-ranked top 3* · holdout</th>
+                                    <th scope="col">Risk-adjusted top 3* · holdout</th>
+                                    <th scope="col">Paired Δ (risk − signal) · daily</th>
+                                    <th scope="col">Ollama reviewed cohort</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ai-evaluation-body"></tbody>
+                        </table>
+                    </div>
+                </section>
 
                 <section class="data-section" aria-labelledby="table-title">
                     <div class="section-heading">
@@ -140,6 +164,8 @@
             <section class="ai-detail-section"><h3>Analysis</h3><p id="ai-details-analysis"></p></section>
             <section class="ai-detail-section"><h3>Signals</h3><p id="ai-details-signals"></p></section>
             <section class="ai-detail-section"><h3>Risks</h3><p id="ai-details-risks"></p></section>
+            <section class="ai-detail-section"><h3>Deterministic risk and data coverage</h3><p id="ai-details-risk-assessment"></p></section>
+            <section class="ai-detail-section"><h3>Ollama review (advisory)</h3><p id="ai-details-model-review"></p></section>
             <section class="ai-detail-section"><h3>Security review</h3><div id="ai-details-security"></div></section>
         </div>
     </dialog>

@@ -12,6 +12,7 @@ from app.chains.solana.adapter import SolanaAdapter
 from app.config import Settings
 from app.database import Base
 from app.features.dashboard.service import get_overview
+import app.features.security_analysis.service as security_analysis_service
 from app.features.security_analysis.service import SecurityAnalysisService
 from app.models import Chain, MarketObservation, RiskFinding, SecurityAnalysis, Token
 from scripts.server import is_workspace_server, process_port
@@ -176,6 +177,78 @@ def test_security_analysis_scores_market_and_risk_data() -> None:
         assert "tokens_sold_percent_supply" in result["creator_activity"]
         assert "combined_cluster_holdings" in result["holder_concentration"]
         assert "creator_linked_cluster_wallets" in result["holder_concentration"]
+
+
+def test_security_analysis_keeps_holder_accounts_and_creator_linkage_separate(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="solana", chain_slug="solana")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="mint-verified",
+            normalized_address="mint-verified",
+        )
+        session.add(token)
+        session.flush()
+        session.add(MarketObservation(
+            token_id=token.id,
+            source="dexscreener",
+            market_cap=12_000,
+            liquidity=8_000,
+            raw_data={
+                "locker_contract": "unverified-locker",
+                "lock_expiration": "2099-01-01",
+                "holder_count": 250,
+            },
+        ))
+        session.commit()
+
+        class FakeHeliusClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def fetch_token_metadata(self, mint):
+                return {"status": "ok", "metadata": {"supply": 1000, "decimals": 0}}
+
+            def fetch_token_holders(self, mint, limit=20):
+                return {
+                    "status": "ok",
+                    "provider": "helius",
+                    "token_address": mint,
+                    "holders": [
+                        {"address": "token-account-1", "account_address": "token-account-1", "ui_amount": 200, "percentage_of_supply": 20},
+                        {"address": "token-account-2", "account_address": "token-account-2", "ui_amount": 100, "percentage_of_supply": 10},
+                    ],
+                    "holder_count": None,
+                    "returned_account_count": 2,
+                    "top_5_percentage": 30,
+                    "top_10_percentage": 30,
+                    "concentration_status": "verified",
+                    "concentration_basis": "top_token_accounts_as_share_of_total_supply",
+                    "observed_at": datetime.now().astimezone().isoformat(),
+                }
+
+        monkeypatch.setattr(security_analysis_service, "HeliusClient", FakeHeliusClient)
+        monkeypatch.setattr(
+            security_analysis_service,
+            "get_settings",
+            lambda: Settings(helius_api_keys="test-key"),
+        )
+
+        result = SecurityAnalysisService().analyze_token(session, token.id)
+
+        assert result["holder_concentration"]["top_10_percent"] == 30
+        assert result["holder_concentration"]["top_10_source"] == "helius"
+        assert result["holder_concentration"]["concentration_basis"] == "top_token_accounts_as_share_of_total_supply"
+        assert result["creator_wallet_cluster"]["creator_wallets"] == []
+        assert result["creator_wallet_cluster"]["status"] == "unknown"
+        assert result["creator_activity"]["creator_address"] is None
+        assert result["creator_activity"]["tokens_sold_percent_supply"] is None
+        assert result["liquidity_security"]["lock_verification"]["status"] == "unknown"
+        assert result["liquidity_security"]["lock_verification"]["lp_lock_verified"] is None
 
 
 def test_security_analysis_uses_latest_saved_fomo_top_ten_holding() -> None:

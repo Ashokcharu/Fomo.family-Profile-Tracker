@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -53,7 +55,7 @@ class HeliusClient:
     def record_key_failure(self, key: str, cooldown_seconds: float = 0.0) -> None:
         self.rotator.record_failure(key, cooldown_seconds)
 
-    def _call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _call(self, method: str, params: Any | None = None) -> dict[str, Any]:
         last_error: str | None = None
         for attempt in range(max(1, self.max_retries + 1)):
             active_key = self.get_active_key()
@@ -122,65 +124,81 @@ class HeliusClient:
         }
 
     def fetch_token_holders(self, mint: str, limit: int = 20) -> dict[str, Any]:
-        response = self._call("getTokenLargestAccounts", {"mint": mint, "limit": limit})
+        response = self._call("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
         if response.get("status") != "ok":
-            return {"provider": "helius", "token_address": mint, "status": response.get("status", "error"), "holders": [], "error": response.get("error")}
+            return {
+                "provider": "helius",
+                "token_address": mint,
+                "status": response.get("status", "error"),
+                "holders": [],
+                "holder_count": None,
+                "returned_account_count": 0,
+                "top_5_percentage": None,
+                "top_10_percentage": None,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "error": response.get("error"),
+            }
 
-        holders = response.get("result", {}).get("value") or response.get("result", {}).get("accounts") or []
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return {
+                "provider": "helius",
+                "token_address": mint,
+                "status": "invalid_response",
+                "holders": [],
+                "holder_count": None,
+                "returned_account_count": 0,
+                "top_5_percentage": None,
+                "top_10_percentage": None,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        holders = result.get("value") or result.get("accounts") or []
         normalized = []
-        for item in holders:
+        for item in holders[:max(1, min(int(limit), 20))]:
             if not isinstance(item, dict):
                 continue
             address = item.get("address") or item.get("owner") or item.get("wallet")
             amount = item.get("amount") or item.get("tokenAmount") or item.get("balance")
-            ui_amount = item.get("uiAmount") or item.get("ui_amount")
+            ui_amount = _ui_amount(item)
             if not address:
                 continue
             normalized.append({
                 "address": address,
+                "account_address": address,
                 "amount": amount,
                 "ui_amount": ui_amount,
-                "percentage_of_supply": item.get("percentage") or item.get("percent") or item.get("share") or None,
+                "percentage_of_supply": None,
             })
 
-        total_supply = response.get("result", {}).get("total_supply") or response.get("result", {}).get("totalSupply")
-        top_5_total = 0.0
-        top_10_total = 0.0
-        for index, item in enumerate(normalized[:10], start=1):
-            value = item.get("ui_amount")
-            if value is None:
-                continue
-            try:
-                amount = float(value)
-            except (TypeError, ValueError):
-                continue
-            top_10_total += amount
-            if index <= 5:
-                top_5_total += amount
-
-        top_5_percent = None
-        top_10_percent = None
-        if total_supply not in (None, 0):
-            try:
-                total_supply_value = float(total_supply)
-                if total_supply_value:
-                    if top_5_total:
-                        top_5_percent = round((top_5_total / total_supply_value) * 100, 2)
-                    if top_10_total:
-                        top_10_percent = round((top_10_total / total_supply_value) * 100, 2)
-            except (TypeError, ValueError):
-                top_5_percent = None
-                top_10_percent = None
+        supply_response = self._call("getTokenSupply", [mint, {"commitment": "confirmed"}])
+        supply_result = supply_response.get("result") if supply_response.get("status") == "ok" else None
+        supply_value = supply_result.get("value") if isinstance(supply_result, dict) else None
+        total_supply = (
+            _ui_amount(supply_value)
+            if isinstance(supply_value, dict)
+            else _number_or_none(result.get("total_supply") or result.get("totalSupply"))
+        )
+        for item in normalized:
+            if total_supply and item["ui_amount"] is not None:
+                item["percentage_of_supply"] = round(item["ui_amount"] / total_supply * 100, 6)
+        supplied_count = result.get("holder_count") or result.get("total_holder_count") or result.get("totalHolderCount")
+        top_5_percent = _percentage_of_supply(normalized[:5], total_supply)
+        top_10_percent = _percentage_of_supply(normalized[:10], total_supply)
 
         return {
             "provider": "helius",
             "token_address": mint,
             "status": "ok",
             "holders": normalized,
-            "holder_count": len(normalized),
+            "holder_count": _integer_or_none(supplied_count),
+            "returned_account_count": len(normalized),
             "total_supply": total_supply,
             "top_5_percentage": top_5_percent,
             "top_10_percentage": top_10_percent,
+            "concentration_status": "verified" if top_10_percent is not None else "unknown",
+            "concentration_basis": "top_token_accounts_as_share_of_total_supply",
+            "supply_status": "verified" if total_supply is not None else supply_response.get("status", "unavailable"),
+            "observed_at": datetime.now(timezone.utc).isoformat(),
         }
 
     def fetch_token_metadata(self, mint: str) -> dict[str, Any]:
@@ -204,6 +222,8 @@ class HeliusClient:
                 "mutable": asset.get("mutable") or token_info.get("mutable"),
                 "token_program": asset.get("token_program") or token_info.get("token_program"),
                 "verified": asset.get("verified_metadata") or metadata.get("verified") or False,
+                "authorities": _normalized_addresses(asset.get("authorities")),
+                "creators": _normalized_addresses(asset.get("creators")),
             },
         }
 
@@ -236,3 +256,63 @@ class HeliusClient:
             "holdings": holdings,
             "holding_count": len(holdings),
         }
+
+
+def _number_or_none(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric >= 0 else None
+
+
+def _ui_amount(value: Any) -> float | None:
+    if not isinstance(value, dict):
+        return _number_or_none(value)
+    ui_value = value.get("uiAmount")
+    if ui_value is None:
+        ui_value = value.get("ui_amount") or value.get("uiAmountString")
+    if ui_value is not None:
+        return _number_or_none(ui_value)
+    raw_amount = value.get("amount")
+    decimals = _integer_or_none(value.get("decimals"))
+    if raw_amount is None or decimals is None:
+        return None
+    try:
+        return float(Decimal(str(raw_amount)) / (Decimal(10) ** decimals))
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+
+
+def _integer_or_none(value: Any) -> int | None:
+    numeric = _number_or_none(value)
+    return int(numeric) if numeric is not None else None
+
+
+def _percentage_of_supply(accounts: list[dict[str, Any]], total_supply: Any) -> float | None:
+    try:
+        supply = Decimal(str(total_supply))
+        amounts = [Decimal(str(account.get("ui_amount"))) for account in accounts]
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if supply <= 0 or not accounts:
+        return None
+    if any(amount < 0 for amount in amounts):
+        return None
+    return round(float(sum(amounts) / supply * 100), 2)
+
+
+def _normalized_addresses(values: Any) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    normalized = []
+    for item in values:
+        if isinstance(item, dict) and isinstance(item.get("address"), str):
+            normalized.append({
+                "address": item["address"],
+                "share": _number_or_none(item.get("share")),
+                "verified": item.get("verified") is True,
+            })
+        elif isinstance(item, str):
+            normalized.append({"address": item, "share": None, "verified": False})
+    return normalized

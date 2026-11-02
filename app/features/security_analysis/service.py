@@ -119,41 +119,17 @@ class SecurityAnalysisService:
         )
         wallets = [row[0] for row in wallet_rows]
         settings = get_settings()
-        if token is not None and token.chain and token.chain.chain_name.lower() == "solana" and settings.helius_keys:
-            client = HeliusClient(
-                settings.helius_keys,
-                request_timeout_seconds=settings.helius_request_timeout_seconds,
-                max_retries=settings.helius_max_retries,
-                rotation_enabled=settings.helius_key_rotation_enabled,
-            )
-            holder_address = self._normalized_token_address(token)
-            holders_response = client.fetch_token_holders(holder_address, limit=10)
-            if holders_response.get("status") == "ok":
-                holders = holders_response.get("holders", [])
-                wallet_addresses = [holder.get("address") for holder in holders if holder.get("address")]
-                if wallet_addresses:
-                    wallets = wallet_addresses
-
-        combined_percentage = None
-        if wallets and settings.helius_keys and token is not None and token.chain and token.chain.chain_name.lower() == "solana":
-            client = HeliusClient(
-                settings.helius_keys,
-                request_timeout_seconds=settings.helius_request_timeout_seconds,
-                max_retries=settings.helius_max_retries,
-                rotation_enabled=settings.helius_key_rotation_enabled,
-            )
-            holders_response = client.fetch_token_holders(self._normalized_token_address(token), limit=10)
-            if holders_response.get("status") == "ok":
-                combined_percentage = holders_response.get("top_5_percentage")
 
         return {
-            "connected_wallet_count": len(wallets),
-            "confirmed_creator_controlled_wallets": wallets[:5],
-            "potential_creator_connected_wallets": wallets[5:10],
+            "connected_wallet_count": None,
+            "confirmed_creator_controlled_wallets": [],
+            "potential_creator_connected_wallets": [],
+            "observed_trader_wallets": wallets[:10],
             "combined_token_balance": None,
-            "combined_percentage_of_supply": combined_percentage,
-            "threshold": get_settings().creator_connected_holdings_threshold,
-            "status": "inferred" if wallets else "not_available",
+            "combined_percentage_of_supply": None,
+            "threshold": settings.creator_connected_holdings_threshold,
+            "status": "unknown",
+            "creator_linkage_status": "unknown",
         }
 
     def _holder_concentration(
@@ -161,6 +137,7 @@ class SecurityAnalysisService:
         observation: MarketObservation | None,
         token: Token | None = None,
         fomo_metadata: dict[str, Any] | None = None,
+        provider_holders: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raw_data = observation.raw_data if observation and isinstance(observation.raw_data, dict) else {}
         fomo_metadata = fomo_metadata or {}
@@ -179,62 +156,64 @@ class SecurityAnalysisService:
                 raw_data.get("top_10"),
             ) if value is not None
         ), None)
-        creator_linked_cluster_wallets = raw_data.get("creator_linked_cluster_wallets") or raw_data.get("creatorLinkedClusterWallets")
-        combined_cluster_holdings = raw_data.get("combined_cluster_holdings") or raw_data.get("combinedClusterHoldings")
-
-        settings = get_settings()
-        if token is not None and token.chain and token.chain.chain_name.lower() == "solana" and settings.helius_keys:
-            client = HeliusClient(
-                settings.helius_keys,
-                request_timeout_seconds=settings.helius_request_timeout_seconds,
-                max_retries=settings.helius_max_retries,
-                rotation_enabled=settings.helius_key_rotation_enabled,
+        top_accounts = []
+        top_5_source = "market_data" if top_5_percent is not None else None
+        top_10_source = "fomo_family" if fomo_metadata.get("top_10_holding_percent") is not None else (
+            "market_data" if top_10_percent is not None else None
+        )
+        if provider_holders and provider_holders.get("status") == "ok":
+            top_accounts = provider_holders.get("holders", [])
+            if top_5_percent is None and provider_holders.get("top_5_percentage") is not None:
+                top_5_percent = provider_holders["top_5_percentage"]
+                top_5_source = "helius"
+            if top_10_percent is None and provider_holders.get("top_10_percentage") is not None:
+                top_10_percent = provider_holders["top_10_percentage"]
+                top_10_source = "helius"
+            holder_count = holder_count if holder_count is not None else provider_holders.get("holder_count")
+            largest_holder = largest_holder or (
+                top_accounts[0].get("account_address") if top_accounts else None
             )
-            holder_address = self._normalized_token_address(token)
-            holders_response = client.fetch_token_holders(holder_address, limit=10)
-            if holders_response.get("status") == "ok":
-                holder_count = holder_count if holder_count is not None else holders_response.get("holder_count")
-                top_5_percent = top_5_percent if top_5_percent is not None else holders_response.get("top_5_percentage")
-                top_10_percent = top_10_percent if top_10_percent is not None else holders_response.get("top_10_percentage")
-                largest_holder = largest_holder if largest_holder is not None else (
-                    holders_response.get("holders", [{}])[0].get("address") if holders_response.get("holders") else None
-                )
-                creator_linked_cluster_wallets = creator_linked_cluster_wallets if creator_linked_cluster_wallets is not None else len(holders_response.get("holders", []))
-                combined_cluster_holdings = combined_cluster_holdings if combined_cluster_holdings is not None else holders_response.get("top_5_percentage")
-
-            metadata = client.fetch_token_metadata(holder_address)
-            if metadata.get("status") == "ok":
-                supply = metadata.get("metadata", {}).get("supply")
-                if supply is not None:
-                    holder_count = holder_count if holder_count is not None else supply
-
-        largest_holder_percent = self._normalize_percentage(top_5_percent)
-        if combined_cluster_holdings is None:
-            combined_cluster_holdings = largest_holder_percent
-        else:
-            combined_cluster_holdings = self._normalize_percentage(combined_cluster_holdings)
-        if creator_linked_cluster_wallets is None:
-            creator_linked_cluster_wallets = 1 if largest_holder is not None else None
-        if creator_linked_cluster_wallets is not None:
-            try:
-                creator_linked_cluster_wallets = max(1, int(creator_linked_cluster_wallets))
-            except (TypeError, ValueError):
-                creator_linked_cluster_wallets = None
+        largest_holder_percent = self._normalize_percentage(
+            top_accounts[0].get("percentage_of_supply")
+            if top_accounts
+            else raw_data.get("largest_holder_percent")
+        )
+        concentration_provider = (
+            "helius" if top_5_source == "helius" or top_10_source == "helius"
+            else "fomo_family" if top_10_source == "fomo_family"
+            else top_5_source
+        )
+        concentration_status = (
+            "verified" if concentration_provider == "helius" and (
+                top_5_source == "helius" or top_10_source == "helius"
+            )
+            else "provider_reported" if concentration_provider == "fomo_family"
+            else "available" if largest_holder_percent is not None or top_10_percent is not None
+            else "unknown"
+        )
         return {
             "largest_holder": largest_holder,
+            "largest_holder_account": largest_holder,
             "largest_holder_percent": largest_holder_percent,
             "holder_count": holder_count,
-            "top_5_percent": largest_holder_percent,
+            "top_5_percent": self._normalize_percentage(top_5_percent),
+            "top_5_source": top_5_source,
             "top_10_percent": self._normalize_percentage(top_10_percent),
-            "top_10_source": "fomo_family" if fomo_metadata.get("top_10_holding_percent") is not None else (
-                "market_data" if top_10_percent is not None else None
-            ),
-            "creator_linked_cluster_wallets": creator_linked_cluster_wallets,
-            "combined_cluster_holdings": combined_cluster_holdings,
-            "combined_cluster_holdings_percent": combined_cluster_holdings,
-            "creator_cluster_holdings": combined_cluster_holdings,
+            "top_10_source": top_10_source,
+            "top_token_accounts": top_accounts,
+            "returned_token_account_count": len(top_accounts) if provider_holders and provider_holders.get("status") == "ok" else None,
+            "concentration_basis": provider_holders.get("concentration_basis") if provider_holders else None,
+            "concentration_provider": concentration_provider,
+            "concentration_observed_at": provider_holders.get("observed_at") if provider_holders else None,
+            "creator_linked_cluster_wallets": None,
+            "creator_linkage_status": "unknown",
+            "combined_cluster_holdings": None,
+            "combined_cluster_holdings_percent": None,
+            "creator_cluster_holdings": None,
             "adjusted_concentration": None,
-            "status": "inferred" if holder_count is not None or largest_holder is not None or combined_cluster_holdings is not None else "not_available",
+            "status": concentration_status if concentration_status != "unknown" else (
+                "provider_accounts_only" if top_accounts else "not_available"
+            ),
         }
 
     def _liquidity_security(self, observation: MarketObservation | None) -> dict[str, Any]:
@@ -280,51 +259,58 @@ class SecurityAnalysisService:
             )
         return result
 
-    def _provider_status(self, token: Token, include_metadata: bool = False) -> dict[str, Any]:
+    def _provider_status(
+        self,
+        token: Token,
+        include_metadata: bool = False,
+        metadata: dict[str, Any] | None = None,
+        holders: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         settings = get_settings()
         state = {
             "provider": "local_db",
             "implementation_phase": "phase_1",
             "data_quality": "inferred",
             "wallet_data": "unavailable",
+            "holder_accounts": "unavailable",
+            "holder_concentration": "unknown",
+            "creator_linkage": "unknown",
+            "lp_lock_status": "unknown",
             "token_metadata": "unavailable",
             "status": "local_only",
         }
 
         if token.chain and token.chain.chain_name.lower() == "solana" and settings.helius_keys:
-            client = HeliusClient(
-                settings.helius_keys,
-                request_timeout_seconds=settings.helius_request_timeout_seconds,
-                max_retries=settings.helius_max_retries,
-                rotation_enabled=settings.helius_key_rotation_enabled,
-            )
             token_address = self._normalized_token_address(token)
             state["provider"] = "helius"
-            state["implementation_phase"] = "phase_5"
+            state["implementation_phase"] = "phase_2"
             state["chain_adapter"] = self._chain_adapter_name(token)
             state["token_address"] = token_address
-            state["data_quality"] = "hybrid"
             state["status"] = "provider_connected"
             if include_metadata:
-                metadata = client.fetch_token_metadata(token_address)
-                if metadata.get("status") == "ok":
+                if metadata and metadata.get("status") == "ok":
                     state["token_metadata"] = "verified"
-                else:
-                    state["token_metadata"] = "unavailable"
-                holders = client.fetch_token_holders(token_address, limit=5)
-                if holders.get("status") == "ok":
-                    state["wallet_data"] = "verified"
-                else:
-                    state["wallet_data"] = "unavailable"
+                if holders and holders.get("status") == "ok":
+                    state["holder_accounts"] = "provider_observed"
+                    state["wallet_data"] = "token_accounts_only"
+                    state["holder_concentration"] = holders.get("concentration_status", "unknown")
+                    state["concentration_basis"] = holders.get("concentration_basis")
+                    state["holder_data_observed_at"] = holders.get("observed_at")
             else:
                 state["token_metadata"] = "available"
-                state["wallet_data"] = "available"
+                state["holder_accounts"] = "available"
+                state["wallet_data"] = "token_accounts_only"
         else:
             state["chain_adapter"] = self._chain_adapter_name(token)
             state["token_address"] = self._normalized_token_address(token) if token is not None else None
         return state
 
-    def _creator_wallet_cluster(self, db: Session, token: Token) -> dict[str, Any]:
+    def _creator_wallet_cluster(
+        self,
+        db: Session,
+        token: Token,
+        provider_holders: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         wallet_rows = (
             db.query(TraderTransactionEvent.wallet_address)
             .filter(TraderTransactionEvent.token_id == token.id)
@@ -332,78 +318,82 @@ class SecurityAnalysisService:
             .order_by(TraderTransactionEvent.wallet_address.asc())
             .all()
         )
-        observed_wallets = [row[0] for row in wallet_rows]
+        observed_trader_wallets = [row[0] for row in wallet_rows]
 
         settings = get_settings()
+        holder_accounts = (
+            provider_holders.get("holders", [])
+            if provider_holders and provider_holders.get("status") == "ok"
+            else []
+        )
+        top_5_percentage = (
+            provider_holders.get("top_5_percentage")
+            if provider_holders and provider_holders.get("status") == "ok"
+            else None
+        )
         result = {
-            "creator_wallets": observed_wallets[:10],
-            "connected_wallet_count": len(observed_wallets),
+            "creator_wallets": [],
+            "observed_trader_wallets": observed_trader_wallets[:10],
+            "observed_trader_wallet_count": len(observed_trader_wallets),
+            "connected_wallet_count": None,
             "largest_holder_address": None,
+            "largest_token_account": holder_accounts[0].get("account_address") if holder_accounts else None,
+            "top_token_accounts": holder_accounts,
             "largest_holder_percent": None,
             "combined_percentage_of_supply": None,
             "top_holder_warnings": [],
             "threshold": settings.creator_connected_holdings_threshold,
-            "status": "inferred" if observed_wallets else "not_available",
+            "status": "unknown",
+            "creator_linkage_status": "unknown",
+            "provider": "helius" if provider_holders else None,
+            "provider_observed_at": provider_holders.get("observed_at") if provider_holders else None,
         }
-
-        if token.chain and token.chain.chain_name.lower() == "solana" and settings.helius_keys:
-            client = HeliusClient(
-                settings.helius_keys,
-                request_timeout_seconds=settings.helius_request_timeout_seconds,
-                max_retries=settings.helius_max_retries,
-                rotation_enabled=settings.helius_key_rotation_enabled,
+        if holder_accounts:
+            result["largest_holder_percent"] = holder_accounts[0].get("percentage_of_supply")
+        if top_5_percentage is not None and top_5_percentage >= settings.creator_connected_holdings_threshold:
+            result["top_holder_warnings"].append(
+                "Top token-account concentration exceeds the configured review threshold; creator ownership is not established."
             )
-            holders = client.fetch_token_holders(self._normalized_token_address(token), limit=10)
-            if holders.get("status") == "ok":
-                holder_list = holders.get("holders", [])
-                if holder_list:
-                    top_holder = holder_list[0]
-                    result["creator_wallets"] = [item.get("address") for item in holder_list if item.get("address")][:10]
-                    result["largest_holder_address"] = top_holder.get("address")
-                    result["largest_holder_percent"] = top_holder.get("percentage_of_supply") or holders.get("top_5_percentage")
-                    result["connected_wallet_count"] = len(holder_list)
-                    result["combined_percentage_of_supply"] = holders.get("top_5_percentage")
-                    result["status"] = "verified"
-                    if holders.get("top_5_percentage") is not None and holders.get("top_5_percentage") >= settings.creator_connected_holdings_threshold:
-                        result["top_holder_warnings"].append("Top-wallet concentration exceeds configured creator threshold")
-                else:
-                    result["status"] = "not_available"
 
         return result
 
     def _liquidity_lock_verification(self, observation: MarketObservation | None, token: Token | None = None) -> dict[str, Any]:
         raw_data = observation.raw_data if observation and isinstance(observation.raw_data, dict) else {}
-        lock_contract = raw_data.get("locker_contract") or raw_data.get("lock_contract") or raw_data.get("dex_lock_contract")
-        lock_expiration = raw_data.get("lock_expiration") or raw_data.get("lock_expiry") or raw_data.get("lock_expiry_ts")
-        can_withdraw = bool(raw_data.get("can_potentially_withdraw") or raw_data.get("canPotentiallyWithdraw"))
-        status = "unverified"
-        if lock_contract:
-            status = "verified" if not can_withdraw else "warning"
-        elif observation is not None and observation.liquidity is not None:
-            status = "warning"
-
-        if token is not None and token.chain and token.chain.chain_name.lower() == "solana" and get_settings().helius_keys:
-            client = HeliusClient(
-                get_settings().helius_keys,
-                request_timeout_seconds=get_settings().helius_request_timeout_seconds,
-                max_retries=get_settings().helius_max_retries,
-                rotation_enabled=get_settings().helius_key_rotation_enabled,
-            )
-            metadata = client.fetch_token_metadata(self._normalized_token_address(token))
-            if metadata.get("status") == "ok":
-                lock_contract = lock_contract or metadata.get("metadata", {}).get("locker_contract")
-                if lock_contract:
-                    status = "verified"
+        evidence = raw_data.get("liquidity_lock")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        lock_contract = evidence.get("lock_contract")
+        lock_expiration = evidence.get("lock_expiration")
+        source = evidence.get("provider")
+        verified = (
+            evidence.get("verified") is True
+            and isinstance(lock_contract, str)
+            and bool(lock_contract.strip())
+            and isinstance(source, str)
+            and bool(source.strip())
+        )
+        can_withdraw = evidence.get("can_withdraw") if isinstance(evidence.get("can_withdraw"), bool) else None
+        status = (
+            "warning" if verified and can_withdraw
+            else "verified" if verified and can_withdraw is False
+            else "unknown"
+        )
 
         return {
             "status": status,
             "lock_contract": lock_contract,
             "lock_expiration": lock_expiration,
             "can_potentially_withdraw": can_withdraw,
-            "lp_lock_verified": status == "verified",
-            "report": "Liquidity lock contract is present and not withdrawable" if status == "verified" else "Liquidity lock cannot be confirmed or a withdrawal path is present",
-            "provider": "local_db" if not get_settings().helius_keys else "helius",
-            "verification_method": "raw_market_data" if lock_contract else "inferred",
+            "lp_lock_verified": True if status == "verified" else False if status == "warning" else None,
+            "report": (
+                "Provider evidence confirms a lock contract and no withdrawal path."
+                if status == "verified"
+                else "Provider evidence reports a withdrawal path."
+                if status == "warning"
+                else "No supported provider has verified LP-lock status."
+            ),
+            "provider": source,
+            "verification_method": "provider_evidence" if verified else "unavailable",
+            "observed_at": evidence.get("observed_at"),
         }
 
     def _calculate_risk_score(self, db: Session, token: Token, observation: MarketObservation | None) -> tuple[int, dict[str, Any]]:
@@ -648,65 +638,53 @@ class SecurityAnalysisService:
         risk_score, risk_payload = self._calculate_risk_score(db, token, observation)
         risk_findings = self._build_risk_findings(db, token_id)
         recent_activity = self._recent_wallet_activity(db, token_id)
-        holder_concentration = self._holder_concentration(observation, token, fomo_metadata)
-        creator_cluster = self._creator_wallet_cluster(db, token)
+        helius_metadata: dict[str, Any] | None = None
+        helius_holders: dict[str, Any] | None = None
+        if token.chain and token.chain.chain_name.lower() == "solana" and get_settings().helius_keys:
+            client = HeliusClient(
+                get_settings().helius_keys,
+                request_timeout_seconds=get_settings().helius_request_timeout_seconds,
+                max_retries=get_settings().helius_max_retries,
+                rotation_enabled=get_settings().helius_key_rotation_enabled,
+            )
+            token_address = self._normalized_token_address(token)
+            helius_metadata = client.fetch_token_metadata(token_address)
+            helius_holders = client.fetch_token_holders(token_address, limit=10)
 
-        combined_cluster_holdings = self._normalize_percentage(
-            creator_cluster.get("combined_percentage_of_supply")
-            or holder_concentration.get("combined_cluster_holdings")
-            or holder_concentration.get("combined_cluster_holdings_percent")
-            or holder_concentration.get("top_5_percent")
+        holder_concentration = self._holder_concentration(
+            observation,
+            token,
+            fomo_metadata,
+            helius_holders,
         )
-        creator_wallet_count = (
-            creator_cluster.get("connected_wallet_count")
-            or holder_concentration.get("creator_linked_cluster_wallets")
-            or 1 if creator_cluster.get("largest_holder_address") or holder_concentration.get("largest_holder") else None
-        )
-        if creator_wallet_count is not None:
-            try:
-                creator_wallet_count = max(1, int(creator_wallet_count))
-            except (TypeError, ValueError):
-                creator_wallet_count = None
-
-        sold_supply = self._normalize_percentage(
-            creator_cluster.get("largest_holder_percent")
-            or holder_concentration.get("largest_holder_percent")
-            or holder_concentration.get("top_5_percent")
-            or creator_cluster.get("combined_percentage_of_supply")
-        )
-        if sold_supply is None and combined_cluster_holdings is not None:
-            sold_supply = max(0.0, min(100.0, combined_cluster_holdings * 0.6))
-        transferred_supply = None
-        if combined_cluster_holdings is not None:
-            transferred_supply = max(0.0, min(100.0, combined_cluster_holdings * 0.35))
-        creator_remaining = None
-        if combined_cluster_holdings is not None:
-            creator_remaining = max(0.0, min(100.0, 100.0 - combined_cluster_holdings))
+        creator_cluster = self._creator_wallet_cluster(db, token, helius_holders)
+        combined_cluster_holdings = None
 
         creator_activity = {
-            "creator_address": creator_cluster.get("largest_holder_address") or holder_concentration.get("largest_holder"),
+            "creator_address": None,
             "creator_initial_allocation": None,
             "creator_current_balance": None,
-            "total_tokens_sold": sold_supply,
-            "tokens_sold_percent_supply": sold_supply,
-            "creator_sold_percentage": sold_supply,
-            "total_tokens_transferred": transferred_supply,
-            "tokens_transferred_percent_supply": transferred_supply,
-            "creator_remaining_percentage": creator_remaining,
-            "creator_remaining_percent_supply": creator_remaining,
-            "creator_linked_cluster_wallets": creator_wallet_count,
-            "combined_cluster_holdings": combined_cluster_holdings,
-            "combined_cluster_holdings_percent": combined_cluster_holdings,
-            "largest_holder_percent": self._normalize_percentage(creator_cluster.get("largest_holder_percent") or holder_concentration.get("largest_holder_percent") or holder_concentration.get("top_5_percent")),
+            "total_tokens_sold": None,
+            "tokens_sold_percent_supply": None,
+            "creator_sold_percentage": None,
+            "total_tokens_transferred": None,
+            "tokens_transferred_percent_supply": None,
+            "creator_remaining_percentage": None,
+            "creator_remaining_percent_supply": None,
+            "creator_linked_cluster_wallets": None,
+            "combined_cluster_holdings": None,
+            "combined_cluster_holdings_percent": None,
+            "largest_holder_percent": holder_concentration.get("largest_holder_percent"),
             "recent_transactions": recent_activity,
-            "status": "inferred" if recent_activity else "not_available",
+            "status": "unknown",
+            "creator_linkage_status": "unknown",
         }
-        if creator_activity["combined_cluster_holdings"] is None and holder_concentration.get("top_5_percent") is not None:
-            creator_activity["combined_cluster_holdings"] = holder_concentration["top_5_percent"]
-            creator_activity["combined_cluster_holdings_percent"] = holder_concentration["top_5_percent"]
-        if creator_activity["creator_linked_cluster_wallets"] is None and holder_concentration.get("creator_linked_cluster_wallets") is not None:
-            creator_activity["creator_linked_cluster_wallets"] = holder_concentration.get("creator_linked_cluster_wallets")
-        provider_status = self._provider_status(token, include_metadata=True)
+        provider_status = self._provider_status(
+            token,
+            include_metadata=True,
+            metadata=helius_metadata,
+            holders=helius_holders,
+        )
         liquidity_security = self._liquidity_security(observation)
         liquidity_lock = self._liquidity_lock_verification(observation, token)
         liquidity_security["lock_verification"] = liquidity_lock
@@ -717,9 +695,10 @@ class SecurityAnalysisService:
                 **creator_activity,
                 "creator_wallet_cluster": creator_cluster,
                 "allocation_summary": {
-                    "largest_holder_address": creator_cluster.get("largest_holder_address"),
-                    "largest_holder_percent": creator_cluster.get("largest_holder_percent") or holder_concentration.get("largest_holder_percent"),
-                    "combined_percentage_of_supply": creator_cluster.get("combined_percentage_of_supply") or holder_concentration.get("combined_cluster_holdings"),
+                    "largest_holder_account": holder_concentration.get("largest_holder_account"),
+                    "largest_holder_percent": holder_concentration.get("largest_holder_percent"),
+                    "top_5_token_accounts_percent": holder_concentration.get("top_5_percent"),
+                    "top_10_token_accounts_percent": holder_concentration.get("top_10_percent"),
                     "threshold": creator_cluster.get("threshold"),
                 },
             },

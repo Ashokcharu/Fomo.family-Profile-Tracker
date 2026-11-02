@@ -1,4 +1,7 @@
 from app.models.records import (
+    AIDiscoveryModelAssessment,
+    AIDiscoveryOutcome,
+    AIDiscoverySnapshot,
     AIIntelligenceRecord,
     BackgroundJob,
     Chain,
@@ -18,6 +21,9 @@ from app.models.records import (
 )
 
 __all__ = [
+    "AIDiscoveryModelAssessment",
+    "AIDiscoveryOutcome",
+    "AIDiscoverySnapshot",
     "AIIntelligenceRecord",
     "BackgroundJob",
     "Chain",

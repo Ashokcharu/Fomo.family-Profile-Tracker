@@ -11,7 +11,7 @@ const searchCountEndpoints = {
     tokens: '/tokens/count', followed: '/followed-traders/count', favorites: '/favorites/count', graduated: '/graduated-tokens/count',
     risk: '/risk-analysis/count', dismissed: '/dismissed-tokens/count',
 };
-const aiAnalysisColumns = ['aiRank', 'aiTokenIdentity', 'aiDuration', 'favorite', 'aiScore', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiMore', 'aiCandidateRemove'];
+const aiAnalysisColumns = ['aiRank', 'aiTokenIdentity', 'aiDuration', 'favorite', 'aiScore', 'riskScore', 'dataCompleteness', 'marketCap', 'aiRmc', 'aiHighest', 'aiGrowthCurrent', 'aiGrowthHigh', 'liquidity', 'buyers', 'holders', 'aiMore', 'aiCandidateRemove'];
 const securityReviewScoreTooltip = 'Security Review combines provider-aware market, holder, wallet/creator, liquidity/lock, and recorded risk-finding data. Risk score is the sum of weighted flags, capped at 100: missing market data +15; market cap above graduation threshold +10; liquidity below minimum +20 and an additional liquidity-risk flag +12; stale market data +15; fewer than 50 holders +10; possible withdrawal +10; risk findings critical +25, high +18, medium +12, low +7, other +5 each; graduated token +10. Confidence is a separate heuristic: 40% + half the risk score, clamped to 15–95% (with the current 0–100 score range, this yields 40–90%). Neither number is a guarantee or a measure of data completeness.';
 const securityReviewConfidenceTooltip = 'Heuristic estimate, not data completeness: 40% + half the risk score, clamped to 15–95%. With a risk score capped at 100, the current range is 40–90%.';
 let followedMonitorStatus = { state: 'disabled', message: null };
@@ -78,7 +78,7 @@ const pageDefinitions = {
         eyebrow: 'PINNED CANDIDATES', kicker: 'ACTIVE PICKS', tableTitle: 'Top 3 tracked tokens',
         endpoint: '/ai-discovery/', emptyTitle: 'No eligible picks yet',
         emptyDescription: 'Eligible tokens will appear here after an AI discovery scan.',
-        columns: ['aiRank', 'tokenIdentity', 'address', 'marketCap', 'topPickRmc', 'topPickHigh', 'topPickGrowthCurrent', 'topPickGrowthHigh', 'aiScore', 'aiMore', 'topPickRemove'],
+        columns: ['aiRank', 'tokenIdentity', 'address', 'marketCap', 'topPickRmc', 'topPickHigh', 'topPickGrowthCurrent', 'topPickGrowthHigh', 'aiScore', 'riskScore', 'dataCompleteness', 'aiMore', 'topPickRemove'],
     },
     dismissed: {
         title: 'Dismissed tokens', breadcrumb: 'Dismissed',
@@ -157,7 +157,17 @@ const columnDefinitions = {
     aiAnalyzedAt: { label: 'Removed', title: 'When this candidate was removed from AI Discovery', value: (row) => dateTime(row.ai_analyzed_at) },
     aiMore: { label: 'Details', title: 'Open analysis, signals, risks, and security review', value: () => 'More', action: 'aiDetails' },
     aiRecommendation: { label: 'Assessment', value: (row) => row.recommendation || 'Review' },
-    aiScore: { label: 'Score', title: 'Combined tracked-signal and local-model score from 0 to 100', value: (row) => `${Number(row.score ?? 0).toFixed(1)} / 100` },
+    aiScore: { label: 'Signal', title: 'Deterministic tracked-signal score from 0 to 100. Ollama does not affect eligibility or rank.', value: (row) => `${Number(row.score ?? 0).toFixed(1)} / 100` },
+    dataCompleteness: { label: 'Data', title: 'Share of tracked market fields available, including a historical comparison when available. Not a safety score.', value: (row) => row.data_completeness_percent == null ? 'Unknown' : `${Number(row.data_completeness_percent).toFixed(0)}%` },
+    riskScore: {
+        label: 'Risk',
+        title: 'Deterministic market-risk score from known liquidity and freshness evidence only. Unknown factors are excluded and coverage is available in Details.',
+        value: (row) => row.risk_score == null ? 'Unknown' : `${Number(row.risk_score).toFixed(0)} / 100`,
+        badge: true,
+        toneFrom: (row) => row.risk_score == null ? 'disabled'
+            : Number(row.risk_score) >= 60 ? 'critical'
+                : Number(row.risk_score) >= 30 ? 'warning' : 'positive',
+    },
     aiGrowth: { label: 'Growth', title: 'Current market cap divided by the original tracked RMC', value: (row) => row.growth_multiple === null || row.growth_multiple === undefined ? '—' : `${Number(row.growth_multiple).toFixed(2)}×` },
     aiRmc: { label: 'AI RMC', title: 'AI discovery reached market-cap baseline', value: (row) => compactMoney(row.ai_rmc) },
     aiHighest: { label: 'AIRH', title: 'Highest market cap observed since the AI RMC baseline', value: (row) => compactMoney(row.ai_rh) },
@@ -235,6 +245,9 @@ const elements = {
     emptyDescription: document.getElementById('empty-description'), error: document.getElementById('error-state'),
     errorMessage: document.getElementById('error-message'), count: document.getElementById('result-count'),
     metrics: document.getElementById('metric-grid'), updated: document.getElementById('updated-at'),
+    aiEvaluation: document.getElementById('ai-evaluation-panel'),
+    aiEvaluationNote: document.getElementById('ai-evaluation-note'),
+    aiEvaluationBody: document.getElementById('ai-evaluation-body'),
     search: document.getElementById('view-search'), searchControl: document.getElementById('search-control'), primaryAction: document.getElementById('primary-action'),
     actionLabel: document.getElementById('primary-action-label'), dialog: document.getElementById('entry-dialog'),
     aiRunButton: document.getElementById('ai-run-button'),
@@ -593,7 +606,17 @@ function renderTable(rows, keys) {
                 avatar.className = 'token-avatar';
                 avatar.setAttribute('aria-hidden', 'true');
                 avatar.textContent = String(row.ticker || value || '?').slice(0, 1).toUpperCase();
-                identity.append(avatar);
+                if (row.image_url) {
+                    const image = document.createElement('img');
+                    image.className = 'token-avatar';
+                    image.src = row.image_url;
+                    image.alt = '';
+                    image.loading = 'lazy';
+                    image.addEventListener('error', () => image.replaceWith(avatar), { once: true });
+                    identity.append(image);
+                } else {
+                    identity.append(avatar);
+                }
                 const copy = document.createElement('span');
                 copy.className = 'token-identity-copy';
                 const name = document.createElement('strong');
@@ -611,7 +634,16 @@ function renderTable(rows, keys) {
                 }
                 const ticker = document.createElement('small');
                 ticker.textContent = row.ticker || 'Ticker unavailable';
-                copy.append(name, ticker);
+                const aiBadgeVisible = row.has_ai_discovery_history || row.ai_discovery_since || row.ai_candidate || row.is_ai_candidate || row.ai_rank != null || row.is_top_pick || (activePage === 'topPicks' && row.rank != null);
+                if (aiBadgeVisible) {
+                    const badge = document.createElement('span');
+                    badge.className = 'token-ai-badge';
+                    badge.textContent = 'AI';
+                    badge.title = 'This token has appeared in AI Discovery';
+                    copy.append(name, ticker, badge);
+                } else {
+                    copy.append(name, ticker);
+                }
                 identity.append(copy);
                 cell.append(identity);
                 if (row.contract_address) {
@@ -944,6 +976,13 @@ function renderAiStatus(status) {
         : status.status === 'scanning' ? 'Scanning tracked tokens…'
             : 'Discovery queued…';
     const candidates = Array.isArray(status.candidates) ? status.candidates : [];
+    const outcomeSummary = Array.isArray(status.outcome_summary) ? status.outcome_summary : [];
+    const outcomeSamples = outcomeSummary
+        .map((item) => `${item.horizon_hours}h: ${item.observed_count || 0}`)
+        .join(' · ');
+    const outcomeReturns = outcomeSummary
+        .map((item) => `${item.horizon_hours}h ${item.average_return_percent == null ? '—' : `${Number(item.average_return_percent).toFixed(1)}%`}`)
+        .join(' · ');
     activeRows = candidates;
     elements.description.textContent = status.note || pageDefinitions.ai.description;
     elements.tableTitle.textContent = 'Tracked token candidates';
@@ -951,12 +990,64 @@ function renderAiStatus(status) {
     renderTable(candidates, pageDefinitions.ai.columns);
     elements.aiRunButton.disabled = !enabled || busy;
     elements.aiRunButton.textContent = busy ? progressLabel : enabled ? 'Analyze tracked tokens' : 'AI discovery disabled';
+    renderAiEvaluation(status.evaluation_report);
     setMetrics([
         { label: 'Source', value: 'The Tokens', caption: 'Active tracked tokens only' },
         { label: 'Scanned', value: String(status.tokens_scanned || 0), caption: 'Active tokens evaluated' },
         { label: 'Results', value: String(status.candidate_count || 0), caption: 'Ranked candidates shown' },
         { label: 'Local model', value: status.status === 'model_pending' ? 'Running' : status.model_available ? 'Ready' : 'Fallback', caption: busy ? progressLabel : status.model || 'Ollama unavailable' },
+        { label: 'Outcome samples', value: outcomeSamples || '1h · 6h · 24h', caption: `${outcomeReturns || 'Average return pending'} · mean market-cap return, last 30 days; not a forecast` },
     ]);
+}
+
+function renderAiEvaluation(report) {
+    elements.aiEvaluation.hidden = false;
+    elements.aiEvaluationNote.textContent = report
+        ? `Risk-weight gate: ${report.ranking_policy?.risk_adjusted_status || 'not evaluated'} · active risk/model weights ${report.ranking_policy?.active_risk_weight ?? 0}/${report.ranking_policy?.active_ollama_weight ?? 0}. ${report.ranking_policy?.reason || ''} ${report.window_days}-day research window · latest ${report.holdout_days}-day holdout · ${report.snapshot_count} snapshots. * Both strategies use the same candidates with known risk scores and at least ${report.risk_min_coverage_percent}% factor coverage. ${report.risk_adjusted_method}. ${report.comparison_note} ${report.model_review_note}`
+        : 'Historical comparison will appear after snapshots have outcomes.';
+    elements.aiEvaluationBody.replaceChildren();
+    const horizons = Array.isArray(report?.horizons) ? report.horizons : [];
+    for (const horizon of horizons) {
+        const row = document.createElement('tr');
+        const signal = horizon.signal_top3_risk_covered || {};
+        const adjusted = horizon.risk_adjusted_top3 || {};
+        const model = horizon.ollama_reviewed || {};
+        const cells = [
+            `${horizon.horizon_hours}h`,
+            evaluationMetric(signal),
+            `${evaluationMetric(adjusted)} · ${horizon.risk_covered_snapshots || 0}/${horizon.total_snapshots || 0} risk-known`,
+            horizon.paired_mean_return_delta_percent == null
+                ? `— (${horizon.paired_day_count || 0} paired days)`
+                : `${formatEvaluationPercent(horizon.paired_mean_return_delta_percent)} (${horizon.paired_day_count} paired days)`,
+            model.average_return_percent == null
+                ? '—'
+                : `${evaluationMetric(model)} · model score ${model.average_model_score == null ? '—' : `${Number(model.average_model_score).toFixed(1)}/100`}`,
+        ];
+        for (const value of cells) {
+            const cell = document.createElement('td');
+            cell.textContent = value;
+            row.append(cell);
+        }
+        elements.aiEvaluationBody.append(row);
+    }
+    if (!horizons.length) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 5;
+        cell.textContent = 'No matured, observed outcomes are available yet.';
+        row.append(cell);
+        elements.aiEvaluationBody.append(row);
+    }
+}
+
+function evaluationMetric(metric) {
+    if (metric.average_return_percent == null) return `— (n=${metric.sample_count || 0})`;
+    const winRate = metric.win_rate_percent == null ? '—' : `${Number(metric.win_rate_percent).toFixed(1)}%`;
+    return `${formatEvaluationPercent(metric.average_return_percent)} · win ${winRate} · n=${metric.sample_count}`;
+}
+
+function formatEvaluationPercent(value) {
+    return value == null ? '—' : `${Number(value) > 0 ? '+' : ''}${Number(value).toFixed(1)}%`;
 }
 
 async function loadOverview() {
@@ -1019,6 +1110,7 @@ async function loadPage(page = activePage, requestedPageIndex, searchQuery = pag
         : ['ai', 'analyzed'].includes(page) ? 'Search AI candidates' : 'Search name, ticker, or contract';
     elements.traderSortControl.hidden = page !== 'followed';
     elements.aiRunButton.hidden = page !== 'ai';
+    elements.aiEvaluation.hidden = page !== 'ai';
     elements.traderSort.value = traderSort;
     activeResultCount = undefined;
     elements.title.textContent = definition.title;
@@ -1202,8 +1294,8 @@ function renderAiSecuritySummary(payload, target) {
         if (!Number.isFinite(numeric)) return String(value);
         return `${numeric}%`;
     };
-    const largestHolder = holder.largest_holder || holder.largest_holder_address || creator.largest_holder_address || activity.creator_address || '—';
-    const creatorWalletCount = creator.connected_wallet_count ?? holder.creator_linked_cluster_wallets ?? '—';
+    const largestHolder = holder.largest_holder_account || 'Unknown';
+    const creatorWalletCount = creator.connected_wallet_count ?? holder.creator_linked_cluster_wallets ?? 'Unknown';
     const combinedHoldings = creator.combined_percentage_of_supply ?? holder.combined_cluster_holdings ?? holder.combined_cluster_holdings_percent ?? null;
     const soldSupply = activity.tokens_sold_percent_supply ?? activity.total_tokens_sold ?? activity.creator_sold_percentage ?? null;
     const transferredSupply = activity.tokens_transferred_percent_supply ?? activity.total_tokens_transferred ?? null;
@@ -1228,7 +1320,7 @@ function renderAiSecuritySummary(payload, target) {
                 <h3>Liquidity</h3>
                 <div class="security-review-row"><span>Status</span><strong>${liquidity.status || 'unverified'}</strong></div>
                 <div class="security-review-row"><span>Lock</span><strong>${liquidity.lock_verification?.status || (liquidity.lp_lock_verified ? 'verified' : 'unverified')}</strong></div>
-                <div class="security-review-row"><span>Withdrawal risk</span><strong>${liquidity.lock_verification?.can_potentially_withdraw ? 'Potentially' : 'Not evident'}</strong></div>
+                <div class="security-review-row"><span>Withdrawal risk</span><strong>${liquidity.lock_verification?.can_potentially_withdraw == null ? 'Unknown' : liquidity.lock_verification.can_potentially_withdraw ? 'Potentially' : 'Not evident'}</strong></div>
             </section>
             <section class="security-review-panel">
                 <h3>Creator activity</h3>
@@ -1238,8 +1330,8 @@ function renderAiSecuritySummary(payload, target) {
             </section>
             <section class="security-review-panel">
                 <h3>Holder distribution</h3>
-                <div class="security-review-row"><span>Largest holder</span><strong>${largestHolder}</strong></div>
-                <div class="security-review-row"><span>Top 10 holding (Fomo Family)</span><strong>${formatPercent(holder.top_10_percent)}</strong></div>
+                <div class="security-review-row"><span>Largest token account</span><strong>${largestHolder}</strong></div>
+                <div class="security-review-row"><span>Top 10 holding (${holder.top_10_source || 'unknown source'})</span><strong>${formatPercent(holder.top_10_percent)}</strong></div>
                 <div class="security-review-row"><span>Creator-linked cluster</span><strong>${creatorWalletCount === '—' ? '—' : `${creatorWalletCount} wallets`}</strong></div>
                 <div class="security-review-row"><span>Combined cluster holdings</span><strong>${formatPercent(combinedHoldings)}</strong></div>
             </section>
@@ -1258,6 +1350,31 @@ async function openAiDetails(candidate) {
         ? candidate.strengths.join(' · ') : 'No tracked signals listed.';
     document.getElementById('ai-details-risks').textContent = Array.isArray(candidate.risks) && candidate.risks.length
         ? candidate.risks.join(' · ') : 'No tracked risks listed.';
+    const riskAssessment = candidate.risk_assessment || {};
+    const factorSummary = Array.isArray(riskAssessment.factors)
+        ? riskAssessment.factors
+            .filter((factor) => factor.status !== 'clear')
+            .map((factor) => `${factor.name.replaceAll('_', ' ')} (${factor.status}): ${factor.evidence}`)
+            .join(' · ')
+        : '';
+    document.getElementById('ai-details-risk-assessment').textContent = [
+        `Deterministic risk: ${riskAssessment.risk_score == null ? 'Unknown' : `${Number(riskAssessment.risk_score).toFixed(1)} / 100`}`,
+        `Known-factor coverage: ${riskAssessment.risk_coverage_percent ?? 0}%`,
+        `Evidence confidence: ${riskAssessment.confidence == null ? 'Unknown' : `${Math.round(Number(riskAssessment.confidence) * 100)}%`}`,
+        `Data completeness: ${riskAssessment.data_completeness_percent ?? 0}%`,
+        `Source: ${riskAssessment.data_source || 'Unavailable'}; observed: ${dateTime(riskAssessment.observed_at)}`,
+        factorSummary || 'No elevated known factors; unknown factors are not treated as clear.',
+    ].join(' · ');
+    const modelReview = candidate.model_review;
+    document.getElementById('ai-details-model-review').textContent = modelReview
+        ? [
+            `Advisory only. It does not change eligibility, signal score, or rank. Reviewed: ${dateTime(candidate.model_assessed_at)}. ${candidate.model_summary || ''}`,
+            ...(modelReview.supporting_evidence || []).map((item) => `Evidence: ${item}`),
+            ...(modelReview.concerns || []).map((item) => `Concern: ${item}`),
+            ...(modelReview.missing_data || []).map((item) => `Missing: ${item}`),
+            modelReview.uncertainty ? `Uncertainty: ${modelReview.uncertainty}` : '',
+        ].filter(Boolean).join(' · ')
+        : 'No Ollama review is available. The model review is optional and advisory.';
     securityTarget.innerHTML = '<p class="cell-muted">Loading security review…</p>';
     dialog.showModal();
 
@@ -1309,8 +1426,8 @@ function renderSecurityDetails(payload) {
     };
     const formatNumber = (value) => new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(Number(value));
     const riskLabel = payload?.risk_level || 'unverified';
-    const largestHolder = holder.largest_holder || holder.largest_holder_address || creator.largest_holder_address || activity.creator_address || '—';
-    const creatorWalletCount = creator.connected_wallet_count ?? holder.creator_linked_cluster_wallets ?? '—';
+    const largestHolder = holder.largest_holder_account || 'Unknown';
+    const creatorWalletCount = creator.connected_wallet_count ?? holder.creator_linked_cluster_wallets ?? 'Unknown';
     const combinedHoldings = creator.combined_percentage_of_supply ?? holder.combined_cluster_holdings ?? holder.combined_cluster_holdings_percent ?? null;
     const soldSupply = activity.tokens_sold_percent_supply ?? activity.total_tokens_sold ?? activity.creator_sold_percentage ?? null;
     const transferredSupply = activity.tokens_transferred_percent_supply ?? activity.total_tokens_transferred ?? null;
@@ -1336,7 +1453,7 @@ function renderSecurityDetails(payload) {
                 <div class="security-review-row"><span>Status</span><strong>${liquidityStatus}</strong></div>
                 <div class="security-review-row"><span>LP lock</span><strong>${liquidity.lock_verification?.status || (liquidity.lp_lock_verified ? 'verified' : 'unverified')}</strong></div>
                 <div class="security-review-row"><span>Lock contract</span><strong>${liquidity.lock_contract || liquidity.lock_verification?.lock_contract || '—'}</strong></div>
-                <div class="security-review-row"><span>Withdrew path</span><strong>${liquidity.can_potentially_withdraw || liquidity.lock_verification?.can_potentially_withdraw ? 'Potentially' : 'Not evident'}</strong></div>
+                <div class="security-review-row"><span>Withdrawal risk</span><strong>${(liquidity.can_potentially_withdraw ?? liquidity.lock_verification?.can_potentially_withdraw) == null ? 'Unknown' : (liquidity.can_potentially_withdraw ?? liquidity.lock_verification?.can_potentially_withdraw) ? 'Potentially' : 'Not evident'}</strong></div>
             </section>
             <section class="security-review-panel">
                 <h3>Creator activity</h3>
@@ -1346,8 +1463,8 @@ function renderSecurityDetails(payload) {
             </section>
             <section class="security-review-panel">
                 <h3>Holder distribution</h3>
-                <div class="security-review-row"><span>Largest holder</span><strong>${largestHolder}</strong></div>
-                <div class="security-review-row"><span>Top 10 holding (Fomo Family)</span><strong>${formatPercent(holder.top_10_percent)}</strong></div>
+                <div class="security-review-row"><span>Largest token account</span><strong>${largestHolder}</strong></div>
+                <div class="security-review-row"><span>Top 10 holding (${holder.top_10_source || 'unknown source'})</span><strong>${formatPercent(holder.top_10_percent)}</strong></div>
                 <div class="security-review-row"><span>Creator-linked cluster</span><strong>${creatorWalletCount === '—' ? '—' : `${creatorWalletCount} wallets`}</strong></div>
                 <div class="security-review-row"><span>Combined cluster holdings</span><strong>${formatPercent(combinedHoldings)}</strong></div>
             </section>
@@ -1640,10 +1757,12 @@ elements.tokenForm.addEventListener('submit', async (event) => {
     const submit = elements.tokenForm.querySelector('[type="submit"]');
     submit.disabled = true;
     try {
-        await fetchJson(`/tokens/?${params}`, { method: 'POST' });
+        const result = await fetchJson(`/tokens/?${params}`, { method: 'POST' });
         elements.dialog.close();
         elements.tokenForm.reset();
-        showToast('Token added to tracking.');
+        showToast(result.is_favorite
+            ? 'This token is already in Favorites, which hides it from The Tokens list.'
+            : 'Token added to tracking.');
         await loadPage(activePage);
     } catch (error) {
         showToast(error instanceof Error ? error.message : 'Could not add token.', true);

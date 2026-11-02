@@ -26,9 +26,24 @@ from app.models import (
     TraderTransactionEvent,
 )
 
+_CHAIN_ALIASES = {
+    "bsc": "bnb_chain",
+    "bnb": "bnb_chain",
+    "robinhood": "robinhood_chain",
+}
+_CHAIN_SLUG_ALIASES = {
+    "bnb_chain": ("bnb_chain", "bnb", "bsc"),
+    "robinhood_chain": ("robinhood_chain", "robinhood"),
+}
+_CHAIN_NETWORK_IDS = {
+    "bnb_chain": "56",
+    "robinhood_chain": "4663",
+}
+
 
 def token_identity_key(chain_name: str, address: str) -> tuple[str, str]:
     normalized_chain = (chain_name or "").strip().lower()
+    normalized_chain = _CHAIN_ALIASES.get(normalized_chain, normalized_chain)
     adapter = chain_registry.get(normalized_chain)
     normalized_address = adapter.normalize_address(address) if adapter is not None else address.strip().lower()
     return normalized_chain, normalized_address
@@ -73,19 +88,49 @@ def create_or_get_token(
     name: str | None = None,
 ) -> Token:
     normalized_chain, normalized_address = token_identity_key(chain_name, address)
+    resolve_chain_aliases = chain_id is None
 
     if chain_id is None:
-        chain = db.query(Chain).filter(Chain.chain_slug == normalized_chain).first()
+        network_id = _CHAIN_NETWORK_IDS.get(normalized_chain)
+        chain = (
+            db.query(Chain)
+            .filter(Chain.chain_id == network_id)
+            .order_by(Chain.id.asc())
+            .first()
+            if network_id else None
+        )
         if chain is None:
-            chain = Chain(chain_name=normalized_chain, chain_slug=normalized_chain)
+            chain = db.query(Chain).filter(Chain.chain_slug == normalized_chain).first()
+        if chain is None:
+            chain = Chain(
+                chain_name=normalized_chain,
+                chain_slug=normalized_chain,
+                chain_id=network_id,
+            )
             db.add(chain)
             db.commit()
             db.refresh(chain)
         chain_id = chain.id
 
+    equivalent_chain_ids = [chain_id]
+    network_id = _CHAIN_NETWORK_IDS.get(normalized_chain)
+    if network_id is not None and resolve_chain_aliases:
+        equivalent_chain_ids.extend(
+            id_ for (id_,) in db.query(Chain.id)
+            .filter(
+                (Chain.chain_id == network_id)
+                | Chain.chain_slug.in_(_CHAIN_SLUG_ALIASES[normalized_chain])
+            )
+            .all()
+            if id_ not in equivalent_chain_ids
+        )
     existing = (
         db.query(Token)
-        .filter(Token.chain_id == chain_id, Token.normalized_address == normalized_address)
+        .filter(
+            Token.chain_id.in_(equivalent_chain_ids),
+            func.lower(Token.normalized_address) == normalized_address.lower(),
+        )
+        .order_by(Token.id.asc())
         .first()
     )
     if existing is not None:

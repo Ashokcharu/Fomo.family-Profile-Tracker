@@ -14,12 +14,13 @@ from app.features.ai_discovery.candidate_features import (
     AI_DISCOVERY_ELIGIBILITY_VERSION,
     build_candidate_features,
 )
+from app.features.ai_discovery.risk import build_risk_assessments
 from app.main import app
 from app.features.ai_discovery import service as ai_discovery_service
 from app.features.ai_discovery.service import AIDataService
 from app.features.tokens.service import token_display_data
 from app.integrations.ollama.client import OllamaClient
-from app.models import AIIntelligenceRecord, BackgroundJob, Chain, DismissedToken, Favorite, FollowedTrader, GraduationEvent, MarketObservation, Token, TraderTransactionEvent
+from app.models import AIDiscoveryModelAssessment, AIDiscoveryOutcome, AIDiscoverySnapshot, AIIntelligenceRecord, BackgroundJob, Chain, DismissedToken, Favorite, FollowedTrader, GraduationEvent, MarketObservation, SecurityAnalysis, Token, TraderTransactionEvent
 
 
 class StubOllama:
@@ -113,7 +114,8 @@ def test_discovery_uses_active_tokens_only_and_rejects_unknown_model_ids() -> No
         assert result["status"] == "model_assisted"
         assert result["tokens_scanned"] == 1
         assert [candidate["token_id"] for candidate in result["candidates"]] == [active.id]
-        assert result["candidates"][0]["score"] == 83.5
+        assert result["candidates"][0]["score"] == 85
+        assert result["candidates"][0]["model_score"] == 80
         assert "Must be ignored" not in result["candidates"][0]["summary"]
         prompt_candidates = json.loads(ollama.prompt.split("Candidate: ", 1)[1])
         assert [candidate["token_id"] for candidate in prompt_candidates] == [active.id]
@@ -121,6 +123,12 @@ def test_discovery_uses_active_tokens_only_and_rejects_unknown_model_ids() -> No
         assert len(records) == 1
         assert records[0].token_id == active.id
         assert records[0].manually_entered is False
+        assessment = db.query(AIDiscoveryModelAssessment).one()
+        snapshot = db.query(AIDiscoverySnapshot).one()
+        assert assessment.snapshot_id == snapshot.id
+        assert assessment.model_name == "test-model"
+        assert assessment.score == 80
+        assert len(assessment.assessment_hash) == 64
 
 
 def test_discovery_falls_back_to_tracked_signals_when_ollama_is_unavailable() -> None:
@@ -168,6 +176,7 @@ def test_discovery_defers_and_persists_qwen_assessment() -> None:
 
         assert initial["status"] == "model_pending"
         assert initial["candidates"][0]["model_pending"] is True
+        initial_signal_score = initial["candidates"][0]["score"]
         assert ollama.prompt == ""
         pending = service.get_status(db)
         assert pending["status"] == "model_pending"
@@ -180,6 +189,8 @@ def test_discovery_defers_and_persists_qwen_assessment() -> None:
 
         assert completed["status"] == "model_assisted"
         assert completed["candidates"][0]["model_score"] == 80
+        assert db.query(AIDiscoveryModelAssessment).count() == 1
+        assert completed["candidates"][0]["score"] == initial_signal_score
         assert completed["candidates"][0]["model_pending"] is False
         assert datetime.fromisoformat(completed["candidates"][0]["ai_discovery_since"]).tzinfo == timezone.utc
         db.add(Favorite(token_id=token.id))
@@ -479,7 +490,7 @@ def test_discovery_limits_results_to_top_50_growth_eligible_candidates(monkeypat
         assert sum(token.id in candidate_ids for token in tokens) == 49
 
 
-def test_low_signal_candidate_is_archived_as_failed(monkeypatch) -> None:
+def test_low_signal_candidate_remains_active_while_growth_eligible(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as db:
@@ -507,11 +518,9 @@ def test_low_signal_candidate_is_archived_as_failed(monkeypatch) -> None:
 
         result = service.run_discovery(db, use_model=False)
 
-        assert result["candidates"] == []
-        analyzed = service.list_analyzed_candidates(db)
-        assert len(analyzed) == 1
-        assert analyzed[0]["token_id"] == token.id
-        assert analyzed[0]["archive_reason"] == "failed_low_signal"
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["score"] < 50
+        assert service.list_analyzed_candidates(db) == []
 
 
 def test_early_positive_movement_gets_a_bounded_momentum_signal() -> None:
@@ -586,9 +595,12 @@ def test_growth_gate_allows_automatic_reentry_and_reuses_unchanged_ollama_assess
         qualified = service.run_discovery(db)
         assert round(qualified["candidates"][0]["growth_percent"], 2) == 10.0
         assert qualified["candidates"][0]["ai_rmc"] == 11_000
+        assert qualified["candidates"][0]["ai_discovery_since"] == qualified["last_run_at"]
         assert ollama.generation_calls == 1
 
-        service.run_discovery(db)
+        continuing = service.run_discovery(db)
+        assert continuing["candidates"][0]["ai_rmc"] == 11_000
+        assert continuing["candidates"][0]["ai_discovery_since"] == qualified["candidates"][0]["ai_discovery_since"]
         assert ollama.generation_calls == 1
 
         observe(10_900, 3)
@@ -600,6 +612,24 @@ def test_growth_gate_allows_automatic_reentry_and_reuses_unchanged_ollama_assess
         observe(12_000, 4)
         requalified = service.run_discovery(db)
         assert [candidate["token_id"] for candidate in requalified["candidates"]] == [token.id]
+        assert requalified["candidates"][0]["ai_discovery_since"] == requalified["last_run_at"]
+        assert requalified["candidates"][0]["ai_discovery_since"] != qualified["candidates"][0]["ai_discovery_since"]
+        assert requalified["candidates"][0]["ai_rmc"] == 12_000
+        assert requalified["candidates"][0]["ai_rh"] == 12_000
+        assert requalified["candidates"][0]["ai_growth_multiple"] == 1
+        baseline = db.query(AIIntelligenceRecord).filter_by(
+            token_id=token.id,
+            record_type="ai_discovery_baseline",
+        ).one()
+        assert baseline.data == {"ai_rmc": 12_000, "ai_rh": 12_000}
+        assert baseline.created_at.replace(tzinfo=timezone.utc).isoformat() == (
+            requalified["candidates"][0]["ai_discovery_since"]
+        )
+        snapshots = db.query(AIDiscoverySnapshot).filter_by(token_id=token.id).order_by(
+            AIDiscoverySnapshot.captured_at
+        ).all()
+        assert snapshots[0].market_cap == 11_000
+        assert snapshots[-1].market_cap == 12_000
         assert ollama.generation_calls == 2
 
         assert service.remove_candidate(db, token.id)
@@ -872,6 +902,49 @@ def test_top_pick_requires_positive_growth_from_both_baselines() -> None:
         assert picks[0].token_id == boundary.id
 
 
+def test_active_top_picks_include_current_token_image_for_existing_records() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="image-token",
+            normalized_address="image-token",
+            ticker="IMAGE",
+            name="Image Token",
+        )
+        db.add(token)
+        db.flush()
+        db.add_all([
+            AIIntelligenceRecord(
+                token_id=token.id,
+                record_type="ai_discovery_top_pick",
+                source="ai_discovery",
+                manually_entered=False,
+                data={"active": True, "name": "Image Token"},
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=datetime.now(timezone.utc),
+                market_cap=6_000,
+                raw_data={"image_url": "https://cdn.example/image-token.png"},
+            ),
+        ])
+        db.commit()
+
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        picks = service._active_top_picks(db)
+
+        assert len(picks) == 1
+        assert picks[0]["image_url"] == "https://cdn.example/image-token.png"
+        assert picks[0]["ticker"] == "IMAGE"
+        assert picks[0]["contract_address"] == "image-token"
+
+
 def test_removing_top_pick_refills_from_latest_eligible_candidate() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -1012,3 +1085,434 @@ def test_ollama_availability_is_cached_between_status_checks() -> None:
     assert service._model_available() is True
     assert service._model_available() is True
     assert ollama.availability_checks == 1
+
+
+def test_deterministic_risk_reports_liquidity_divergence_and_data_coverage() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="risk", normalized_address="risk")
+        db.add(token)
+        db.flush()
+        db.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="dexscreener",
+                observed_at=now - timedelta(hours=2),
+                market_cap=10_000,
+                price=0.01,
+                liquidity=10_000,
+                volume=2_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="dexscreener",
+                observed_at=now,
+                market_cap=15_000,
+                price=0.015,
+                liquidity=5_000,
+                volume=4_000,
+            ),
+        ])
+        db.commit()
+
+        risk = build_risk_assessments(db, [token.id], Settings(), now)[token.id]
+
+        assert risk["risk_score"] == 50
+        assert risk["risk_level"] == "moderate"
+        assert risk["data_completeness_percent"] == 71.4
+        assert risk["data_completeness_missing"] == [
+            "holder_count",
+            "top_token_account_concentration",
+        ]
+        factors = {factor["name"]: factor for factor in risk["factors"]}
+        assert factors["liquidity_trend"]["status"] == "risk"
+        assert factors["market_cap_liquidity_divergence"]["status"] == "risk"
+        assert factors["holder_concentration"]["status"] == "unknown"
+        assert factors["market_data_freshness"]["source"] == "dexscreener"
+
+
+def test_risk_uses_only_fresh_verified_helius_account_concentration() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Solana", chain_slug="solana")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="concentration", normalized_address="concentration")
+        db.add(token)
+        db.flush()
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="dexscreener",
+            observed_at=now,
+            market_cap=12_000,
+            liquidity=8_000,
+            price=0.01,
+            volume=500,
+            raw_data={"holder_count": 250},
+        ))
+        db.add(SecurityAnalysis(
+            token_id=token.id,
+            chain_name="Solana",
+            token_address=token.normalized_address,
+            risk_score=20,
+            risk_level="low",
+            analysis_status="ready",
+            last_analyzed_at=now,
+            analysis_payload={
+                "holder_concentration": {
+                    "status": "verified",
+                    "concentration_provider": "helius",
+                    "concentration_basis": "top_token_accounts_as_share_of_total_supply",
+                    "top_10_percent": 25,
+                    "concentration_observed_at": now.isoformat(),
+                },
+            },
+        ))
+        db.commit()
+
+        risk = build_risk_assessments(db, [token.id], Settings(), now)[token.id]
+        factor = next(
+            item for item in risk["factors"]
+            if item["name"] == "top_token_account_concentration"
+        )
+        assert factor["status"] == "risk"
+        assert factor["score"] == 100
+        assert factor["source"] == "helius"
+        assert "not necessarily unique wallets" in factor["evidence"]
+        assert risk["data_completeness_percent"] == 85.7
+
+        analysis = db.query(SecurityAnalysis).filter_by(token_id=token.id).one()
+        analysis.analysis_payload = {
+            **analysis.analysis_payload,
+            "holder_concentration": {
+                **analysis.analysis_payload["holder_concentration"],
+                "concentration_observed_at": (now - timedelta(hours=2)).isoformat(),
+            },
+        }
+        db.commit()
+        stale = build_risk_assessments(db, [token.id], Settings(), now)[token.id]
+        stale_factor = next(
+            item for item in stale["factors"]
+            if item["name"] == "top_token_account_concentration"
+        )
+        assert stale_factor["status"] == "unknown"
+        assert "top_token_account_concentration" in stale["data_completeness_missing"]
+
+
+def test_deterministic_risk_marks_old_latest_observation_stale() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="stale", normalized_address="stale")
+        db.add(token)
+        db.flush()
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="dexscreener",
+            observed_at=now - timedelta(hours=13),
+            market_cap=12_000,
+            liquidity=8_000,
+        ))
+        db.commit()
+
+        risk = build_risk_assessments(db, [token.id], Settings(), now)[token.id]
+        freshness = next(factor for factor in risk["factors"] if factor["name"] == "market_data_freshness")
+
+        assert freshness["status"] == "risk"
+        assert freshness["source"] == "dexscreener"
+        assert "old" in freshness["evidence"]
+
+
+def test_discovery_persists_point_in_time_snapshots_and_horizon_outcomes() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token = Token(chain_id=chain.id, contract_address="outcome", normalized_address="outcome")
+        db.add(token)
+        db.flush()
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="dexscreener",
+            market_cap=20_000,
+            price=0.02,
+            liquidity=10_000,
+            volume=3_000,
+        ))
+        add_ai_baseline(db, token.id, 10_000)
+        db.commit()
+
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        result = service.run_discovery(db, use_model=False)
+        snapshot = db.query(AIDiscoverySnapshot).filter_by(token_id=token.id).one()
+        assert snapshot.signal_score == result["candidates"][0]["score"]
+        assert snapshot.run_id == result["candidates"][0]["run_id"]
+        assert snapshot.risk_assessment["risk_score"] is not None
+
+        captured_at = snapshot.captured_at
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=timezone.utc)
+        snapshot.captured_at = captured_at - timedelta(hours=2)
+        target_at = snapshot.captured_at + timedelta(hours=1)
+        db.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="dexscreener",
+                observed_at=target_at + timedelta(minutes=5),
+                market_cap=24_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="dexscreener",
+                observed_at=target_at - timedelta(minutes=5),
+                market_cap=18_000,
+            ),
+        ])
+        db.commit()
+
+        service._record_due_outcomes(db, datetime.now(timezone.utc))
+        db.commit()
+        outcome = db.query(AIDiscoveryOutcome).filter_by(
+            snapshot_id=snapshot.id,
+            horizon_hours=1,
+        ).one()
+
+        assert outcome.status == "observed"
+        assert outcome.market_cap == 24_000
+        assert outcome.return_percent == 20
+        assert outcome.max_return_percent == 20
+        assert outcome.max_drawdown_percent == 10
+        assert db.query(AIDiscoveryOutcome).filter_by(
+            snapshot_id=snapshot.id,
+            horizon_hours=1,
+        ).count() == 1
+        summary = service._outcome_summary(db)
+        one_hour = next(item for item in summary if item["horizon_hours"] == 1)
+        assert one_hour["observed_count"] == 1
+        assert one_hour["average_return_percent"] == 20
+
+
+def test_evaluation_compares_paired_signal_and_risk_adjusted_picks_without_rewriting_rank() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        snapshots = []
+        for token_id, (signal, risk, returned, rank) in enumerate(
+            ((90, 100, 100, 1), (80, 0, 20, 2), (70, 0, -10, 3), (60, 0, 40, 4)),
+            start=1,
+        ):
+            token = Token(
+                chain_id=chain.id,
+                contract_address=f"eval-{token_id}",
+                normalized_address=f"eval-{token_id}",
+            )
+            db.add(token)
+            db.flush()
+            snapshot = AIDiscoverySnapshot(
+                token_id=token.id,
+                run_id="paired-run",
+                captured_at=now - timedelta(hours=2),
+                rank=rank,
+                signal_score=signal,
+                market_cap=10_000,
+                risk_score=risk,
+                data_completeness=100,
+                risk_assessment={"risk_coverage_percent": 80},
+            )
+            db.add(snapshot)
+            db.flush()
+            snapshots.append(snapshot)
+            db.add(AIDiscoveryOutcome(
+                snapshot_id=snapshot.id,
+                horizon_hours=1,
+                target_at=now - timedelta(hours=1),
+                observed_at=now - timedelta(minutes=55),
+                status="observed",
+                market_cap=10_000 * (1 + returned / 100),
+                return_percent=returned,
+                max_return_percent=max(0, returned),
+                max_drawdown_percent=max(0, -returned),
+            ))
+        db.add(AIDiscoveryModelAssessment(
+            snapshot_id=snapshots[0].id,
+            model_name="test-model",
+            score=75,
+            assessment_hash="a" * 64,
+            assessed_at=now - timedelta(hours=1, minutes=55),
+        ))
+        development_token = Token(
+            chain_id=chain.id,
+            contract_address="eval-development",
+            normalized_address="eval-development",
+        )
+        db.add(development_token)
+        db.flush()
+        development_snapshot = AIDiscoverySnapshot(
+            token_id=development_token.id,
+            run_id="development-run",
+            captured_at=now - timedelta(days=15),
+            rank=1,
+            signal_score=75,
+            market_cap=10_000,
+            risk_score=20,
+            data_completeness=100,
+            risk_assessment={"risk_coverage_percent": 80},
+        )
+        db.add(development_snapshot)
+        db.flush()
+        db.add(AIDiscoveryOutcome(
+            snapshot_id=development_snapshot.id,
+            horizon_hours=1,
+            target_at=now - timedelta(days=15) + timedelta(hours=1),
+            observed_at=now - timedelta(days=15) + timedelta(hours=1, minutes=5),
+            status="observed",
+            market_cap=11_000,
+            return_percent=10,
+            max_return_percent=10,
+            max_drawdown_percent=0,
+        ))
+        db.commit()
+
+        report = AIDataService(Settings(), StubOllama(False))._evaluation_report(db)
+        one_hour = next(row for row in report["horizons"] if row["horizon_hours"] == 1)
+
+        assert one_hour["signal_top3_risk_covered"]["average_return_percent"] == 36.67
+        assert one_hour["risk_adjusted_top3"]["average_return_percent"] == 16.67
+        assert one_hour["paired_run_count"] == 1
+        assert one_hour["paired_mean_return_delta_percent"] == -20
+        assert one_hour["ollama_reviewed"]["average_return_percent"] == 100
+        assert one_hour["ollama_reviewed"]["average_model_score"] == 75
+        assert one_hour["development"]["signal_top3_risk_covered"]["average_return_percent"] == 10
+        assert one_hour["development"]["paired_run_count"] == 1
+        assert one_hour["paired_return_delta_95_ci"]["lower_percent"] is None
+        assert report["ranking_policy"]["risk_adjusted_status"] == "insufficient_evidence"
+        assert report["ranking_policy"]["active_risk_weight"] == 0
+        assert report["ranking_policy"]["active_ollama_weight"] == 0
+        assert [snapshot.rank for snapshot in snapshots] == [1, 2, 3, 4]
+
+
+def test_risk_adjusted_promotion_requires_full_independent_holdout_evidence() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        token_data = (
+            ("high-risk", 90, 100, -20, 30),
+            ("signal-two", 80, 0, 10, 0),
+            ("signal-three", 70, 0, 20, 0),
+            ("adjusted-three", 60, 0, 15, 0),
+        )
+        tokens = []
+        for address, _, _, _, _ in token_data:
+            token = Token(
+                chain_id=chain.id,
+                contract_address=address,
+                normalized_address=address,
+            )
+            db.add(token)
+            db.flush()
+            tokens.append(token)
+
+        for day_offset in range(10, 0, -1):
+            run_id = f"holdout-{day_offset}"
+            capture_day = (now - timedelta(days=day_offset)).date()
+            captured_at = datetime.combine(capture_day, datetime.min.time(), timezone.utc) + timedelta(minutes=10)
+            for rank, (token, (_, signal, risk, returned, drawdown)) in enumerate(
+                zip(tokens, token_data),
+                start=1,
+            ):
+                snapshot = AIDiscoverySnapshot(
+                    token_id=token.id,
+                    run_id=run_id,
+                    captured_at=captured_at,
+                    rank=rank,
+                    signal_score=signal,
+                    market_cap=10_000,
+                    risk_score=risk,
+                    data_completeness=100,
+                    risk_assessment={"risk_coverage_percent": 80},
+                )
+                db.add(snapshot)
+                db.flush()
+                for horizon in (1, 6, 24):
+                    target_at = captured_at + timedelta(hours=horizon)
+                    db.add(AIDiscoveryOutcome(
+                        snapshot_id=snapshot.id,
+                        horizon_hours=horizon,
+                        target_at=target_at,
+                        observed_at=target_at + timedelta(minutes=5),
+                        status="observed",
+                        market_cap=10_000 * (1 + returned / 100),
+                        return_percent=returned,
+                        max_return_percent=max(0, returned),
+                        max_drawdown_percent=drawdown,
+                    ))
+            if day_offset == 10:
+                duplicate_capture = captured_at + timedelta(minutes=30)
+                for rank, (token, (_, signal, risk, _, _)) in enumerate(
+                    zip(tokens, token_data),
+                    start=1,
+                ):
+                    snapshot = AIDiscoverySnapshot(
+                        token_id=token.id,
+                        run_id="same-day-repeat",
+                        captured_at=duplicate_capture,
+                        rank=rank,
+                        signal_score=signal,
+                        market_cap=10_000,
+                        risk_score=risk,
+                        data_completeness=100,
+                        risk_assessment={"risk_coverage_percent": 80},
+                    )
+                    db.add(snapshot)
+                    db.flush()
+                    for horizon in (1, 6, 24):
+                        target_at = duplicate_capture + timedelta(hours=horizon)
+                        db.add(AIDiscoveryOutcome(
+                            snapshot_id=snapshot.id,
+                            horizon_hours=horizon,
+                            target_at=target_at,
+                            observed_at=target_at + timedelta(minutes=5),
+                            status="observed",
+                            market_cap=1,
+                            return_percent=-99,
+                            max_return_percent=0,
+                            max_drawdown_percent=99,
+                        ))
+        db.commit()
+
+        report = AIDataService(Settings(), StubOllama(False))._evaluation_report(db)
+
+        assert report["ranking_policy"]["risk_adjusted_status"] == "ready_for_manual_review"
+        assert report["ranking_policy"]["active_risk_weight"] == 0
+        assert report["ranking_policy"]["active_ollama_weight"] == 0
+        assert report["ranking_policy"]["promotion_requires_manual_approval"] is True
+        for horizon in report["horizons"]:
+            holdout = horizon["holdout"]
+            assert holdout["paired_run_count"] == 10
+            assert holdout["paired_day_count"] == 10
+            assert holdout["risk_adjusted_top3"]["average_return_percent"] == 15
+            assert holdout["paired_return_delta_95_ci"]["lower_percent"] > 0
+            assert holdout["paired_mean_max_drawdown_delta_percent"] < 0
+        status = AIDataService(Settings(ai_discovery_enabled=False), StubOllama(False)).get_status(db)
+        assert status["evaluation_report"]["ranking_policy"]["risk_adjusted_status"] == "ready_for_manual_review"
