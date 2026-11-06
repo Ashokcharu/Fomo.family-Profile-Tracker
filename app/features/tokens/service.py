@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from sqlalchemy import and_, func, or_
@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.features.ai_discovery.candidate_features import AI_DISCOVERY_ELIGIBILITY_VERSION
 from app.chains import chain_registry
+from app.features.market_data.provider_selection import (
+    confirmed_market_cap_peaks,
+    preferred_market_cap_sources,
+)
 from app.integrations.dexscreener.client import dexscreener_chain_name
 from app.models import (
     AIIntelligenceRecord,
@@ -277,9 +281,22 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
         settings.high_priority_data_freshness_seconds,
     )
     observed_now = datetime.now(timezone.utc)
-    latest_observations = _observations_by_time(db, token_ids, latest=True)
+    preferred_market_cap_providers = preferred_market_cap_sources(db, token_ids)
+    fresh_preferred_market_cap_providers = preferred_market_cap_sources(
+        db,
+        token_ids,
+        fresh_after=observed_now - timedelta(seconds=stale_after_seconds),
+    )
+    latest_observations = _observations_by_time(
+        db,
+        token_ids,
+        latest=True,
+        preferred_provider_by_token=fresh_preferred_market_cap_providers,
+    )
     holder_counts: dict[int, int] = {}
     fomo_holder_counts: dict[int, int] = {}
+    holder_count_observed_at: dict[int, datetime] = {}
+    fomo_holder_count_observed_at: dict[int, datetime] = {}
     holder_fields = ("fomo_holder_count", "holder_count", "holders_count", "holderCount", "holders")
     holder_expressions = [
         MarketObservation.raw_data[field].as_integer()
@@ -304,26 +321,36 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
         holder_count = _holder_count(payload)
         if holder_count is not None:
             holder_counts.setdefault(observation.token_id, holder_count)
+            holder_count_observed_at.setdefault(observation.token_id, observation.observed_at)
         fomo_holder_count = _fomo_holder_count(payload)
         if fomo_holder_count is not None:
             fomo_holder_counts.setdefault(observation.token_id, fomo_holder_count)
+            fomo_holder_count_observed_at.setdefault(observation.token_id, observation.observed_at)
 
     first_observations = _observations_by_time(
         db,
         token_ids,
         latest=False,
         after_tracking_start=True,
+        preferred_provider_by_token=preferred_market_cap_providers,
     )
 
     initial_market_caps: dict[int, float] = {}
-    for token_id, market_cap in (
+    discovery_query = (
         db.query(DiscoveryEvent.token_id, DiscoveryEvent.initial_market_cap)
         .join(Token, Token.id == DiscoveryEvent.token_id)
         .filter(DiscoveryEvent.token_id.in_(token_ids), DiscoveryEvent.initial_market_cap.is_not(None))
         .filter(DiscoveryEvent.discovered_at >= func.coalesce(Token.first_seen_at, Token.created_at))
-        .order_by(DiscoveryEvent.discovered_at.asc(), DiscoveryEvent.id.asc())
-        .all()
-    ):
+    )
+    if preferred_market_cap_providers:
+        discovery_query = discovery_query.filter(
+            ~DiscoveryEvent.token_id.in_(set(preferred_market_cap_providers))
+            | (DiscoveryEvent.provider_name == "fomo_family")
+        )
+    for token_id, market_cap in discovery_query.order_by(
+        DiscoveryEvent.discovered_at.asc(),
+        DiscoveryEvent.id.asc(),
+    ).all():
         initial_market_caps.setdefault(token_id, market_cap)
 
     peak_market_caps: dict[int, float] = {}
@@ -331,6 +358,16 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
         token.id: token.first_seen_at or token.created_at
         for token, _, _ in rows
     }
+    preferred_peaks = confirmed_market_cap_peaks(
+        db,
+        token_ids,
+        tracking_starts,
+        preferred_market_cap_providers,
+    )
+    peak_market_caps.update({
+        token_id: peak[0]
+        for token_id, peak in preferred_peaks.items()
+    })
     for token_id, market_cap, highest_observed_at, graduated_at in (
         db.query(
             GraduationEvent.token_id,
@@ -344,13 +381,14 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
         tracking_start = tracking_starts.get(token_id)
         peak_observed_at = highest_observed_at or graduated_at
         if (
-            market_cap is not None
+            token_id not in preferred_market_cap_providers
+            and market_cap is not None
             and tracking_start is not None
             and peak_observed_at is not None
             and peak_observed_at >= tracking_start
         ):
             peak_market_caps[token_id] = max(peak_market_caps.get(token_id, market_cap), market_cap)
-    for token_id, market_cap in (
+    peak_query = (
         db.query(MarketObservation.token_id, func.max(MarketObservation.market_cap))
         .join(Token, Token.id == MarketObservation.token_id)
         .filter(MarketObservation.token_id.in_(token_ids), MarketObservation.market_cap.is_not(None))
@@ -358,9 +396,12 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             MarketObservation.is_valid.is_(True),
             MarketObservation.observed_at >= func.coalesce(Token.first_seen_at, Token.created_at),
         )
-        .group_by(MarketObservation.token_id)
-        .all()
-    ):
+    )
+    if preferred_market_cap_providers:
+        peak_query = peak_query.filter(
+            ~MarketObservation.token_id.in_(set(preferred_market_cap_providers))
+        )
+    for token_id, market_cap in peak_query.group_by(MarketObservation.token_id).all():
         if market_cap is not None:
             peak_market_caps[token_id] = max(peak_market_caps.get(token_id, market_cap), market_cap)
 
@@ -418,7 +459,25 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             market_data_age_seconds = max(0, int((observed_now - observed_at).total_seconds()))
         else:
             market_data_age_seconds = None
-        market_cap_source = payload.get("market_cap_source")
+        holder_observed_at = (
+            fomo_holder_count_observed_at.get(token.id)
+            if token.id in fomo_holder_counts
+            else holder_count_observed_at.get(token.id)
+        )
+        if holder_observed_at is not None:
+            if holder_observed_at.tzinfo is None:
+                holder_observed_at = holder_observed_at.replace(tzinfo=timezone.utc)
+            else:
+                holder_observed_at = holder_observed_at.astimezone(timezone.utc)
+            holder_data_age_seconds = max(
+                0,
+                int((observed_now - holder_observed_at).total_seconds()),
+            )
+        else:
+            holder_data_age_seconds = None
+        market_cap_source = payload.get("market_cap_source") or (
+            observation.provider_name if observation else None
+        )
         market_data_warnings = []
         if market_data_age_seconds is None:
             market_data_warnings.append("no_data")
@@ -458,6 +517,10 @@ def _token_data_for_rows(db: Session, rows: list[tuple[Token, str, str | None]])
             "market_data_warnings": market_data_warnings,
             "liquidity": observation.liquidity if observation else None,
             "fomo_holder_count": fomo_holder_counts.get(token.id, holder_counts.get(token.id)),
+            "fomo_holder_count_stale": (
+                holder_data_age_seconds is None
+                or holder_data_age_seconds > stale_after_seconds
+            ),
             "reach_market_cap": initial_market_cap,
             "reached_high_market_cap": peak_market_cap,
             "highest_observed_market_cap": peak_market_cap,
@@ -499,6 +562,7 @@ def _observations_by_time(
     *,
     latest: bool,
     after_tracking_start: bool = False,
+    preferred_provider_by_token: dict[int, str] | None = None,
 ) -> dict[int, MarketObservation]:
     if not token_ids:
         return {}
@@ -514,6 +578,28 @@ def _observations_by_time(
         query = query.join(Token, Token.id == MarketObservation.token_id).filter(
             MarketObservation.observed_at >= func.coalesce(Token.first_seen_at, Token.created_at)
         )
+    if preferred_provider_by_token:
+        preferred_token_ids = set(preferred_provider_by_token)
+        preferred_providers = set(preferred_provider_by_token.values())
+        provider_filters = [
+            MarketObservation.provider_name.in_(preferred_providers),
+        ]
+        if "fomo_family" in preferred_providers:
+            provider_filters.append(
+                MarketObservation.source == "fomo_family_discovery"
+            )
+        preferred_observations = and_(
+            MarketObservation.token_id.in_(preferred_token_ids),
+            or_(*provider_filters),
+        )
+        unpreferred_token_ids = set(token_ids) - set(preferred_provider_by_token)
+        if unpreferred_token_ids:
+            query = query.filter(or_(
+                preferred_observations,
+                MarketObservation.token_id.in_(unpreferred_token_ids),
+            ))
+        else:
+            query = query.filter(preferred_observations)
     observation_times = query.group_by(MarketObservation.token_id).subquery()
     order = (MarketObservation.id.desc() if latest else MarketObservation.id.asc())
     observations = (

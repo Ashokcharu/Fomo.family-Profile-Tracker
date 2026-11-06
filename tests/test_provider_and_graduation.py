@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.database import Base
 from app.features.discovery.service import calculate_discovery_score, is_reeligible_after_dismissal
-from app.features.graduated_tokens.service import create_graduation, graduation_gain_percent, record_graduation_progress, reconcile_graduation_eligibility, should_graduate
+from app.features.graduated_tokens.service import create_graduation, graduation_gain_percent, list_graduated_tokens, market_cap_has_recent_confirmation, record_graduation_progress, reconcile_graduation_eligibility, should_graduate
 from app.features.market_data.service import market_cap_for_field, provider_priority_for_field
 from app.integrations.dexscreener.client import DexScreenerClient, dexscreener_chain_name
 from app.models import Chain, DiscoveryEvent, GraduationEvent, Token
@@ -163,11 +163,23 @@ def test_market_refresh_graduates_once_and_updates_peak() -> None:
 
         assert record_graduation_progress(session, token, 50000, 49999) is None
         first_event = record_graduation_progress(
-            session, token, 50000, 51000, liquidity_usd=5000, minimum_liquidity_usd=5000
+            session,
+            token,
+            50000,
+            51000,
+            liquidity_usd=5000,
+            minimum_liquidity_usd=5000,
+            market_cap_confirmed=True,
         )
         session.flush()
         second_event = record_graduation_progress(
-            session, token, 50000, 72000, liquidity_usd=5000, minimum_liquidity_usd=5000
+            session,
+            token,
+            50000,
+            72000,
+            liquidity_usd=5000,
+            minimum_liquidity_usd=5000,
+            market_cap_confirmed=True,
         )
         session.commit()
 
@@ -217,6 +229,247 @@ def test_low_liquidity_cannot_create_or_update_graduation() -> None:
         assert existing_event.highest_observed_market_cap == 51000
 
 
+def test_market_cap_spike_must_be_confirmed_before_graduation_or_peak_update() -> None:
+    from app.models import MarketObservation
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="robinhood_chain", chain_slug="robinhood")
+        session.add(chain)
+        session.flush()
+        started_at = datetime(2026, 11, 1, 18, 30)
+        token = Token(
+            chain_id=chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+            first_seen_at=started_at + timedelta(minutes=15),
+        )
+        session.add(token)
+        session.flush()
+        session.add(MarketObservation(
+            token_id=token.id,
+            source="scheduled_refresh",
+            provider_name="dexscreener",
+            observed_at=started_at,
+            market_cap=60000,
+            is_valid=True,
+        ))
+        session.flush()
+
+        assert market_cap_has_recent_confirmation(
+            session, token.id, 1_210_000, started_at + timedelta(minutes=30)
+        ) is False
+        assert record_graduation_progress(
+            session,
+            token,
+            50000,
+            1_210_000,
+            started_at + timedelta(minutes=30),
+            liquidity_usd=5000,
+            minimum_liquidity_usd=5000,
+            market_cap_confirmed=False,
+        ) is None
+
+        event = create_graduation(session, token, 50000, 60000)
+        assert record_graduation_progress(
+            session,
+            token,
+            50000,
+            1_210_000,
+            started_at + timedelta(minutes=30),
+            existing_event=event,
+            liquidity_usd=5000,
+            minimum_liquidity_usd=5000,
+            market_cap_confirmed=False,
+        ) is event
+        assert event.highest_observed_market_cap == 60000
+
+        session.add(MarketObservation(
+            token_id=token.id,
+            source="scheduled_refresh",
+            provider_name="dexscreener",
+            observed_at=started_at + timedelta(minutes=60),
+            market_cap=70000,
+            is_valid=True,
+        ))
+        session.flush()
+        assert market_cap_has_recent_confirmation(
+            session, token.id, 70000, started_at + timedelta(minutes=90)
+        ) is True
+        updated_event = record_graduation_progress(
+            session,
+            token,
+            50000,
+            70000,
+            started_at + timedelta(minutes=90),
+            existing_event=event,
+            liquidity_usd=5000,
+            minimum_liquidity_usd=5000,
+            market_cap_confirmed=True,
+        )
+        assert updated_event is event
+        assert event.highest_observed_market_cap == 70000
+
+
+def test_graduation_reconciliation_replaces_unconfirmed_peak_with_confirmed_peak() -> None:
+    from app.models import MarketObservation
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        chain = Chain(chain_name="robinhood_chain", chain_slug="robinhood")
+        session.add(chain)
+        session.flush()
+        tracking_start = datetime(2026, 11, 1, 18, 0)
+        token = Token(
+            chain_id=chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+            first_seen_at=tracking_start,
+            is_graduated=True,
+        )
+        session.add(token)
+        session.flush()
+        session.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                observed_at=tracking_start + timedelta(minutes=5),
+                market_cap=40000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                observed_at=tracking_start + timedelta(minutes=35),
+                market_cap=60000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                observed_at=tracking_start + timedelta(minutes=65),
+                market_cap=70000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                observed_at=tracking_start + timedelta(minutes=95),
+                market_cap=1_210_000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                observed_at=tracking_start + timedelta(minutes=125),
+                market_cap=45000,
+                is_valid=True,
+            ),
+        ])
+        event = GraduationEvent(
+            token_id=token.id,
+            graduated_at=tracking_start + timedelta(minutes=35),
+            market_cap_at_graduation=60000,
+            threshold_usd=50000,
+            highest_observed_market_cap=1_210_000,
+            highest_observed_at=tracking_start + timedelta(minutes=95),
+        )
+        session.add(event)
+        session.commit()
+
+        assert reconcile_graduation_eligibility(session, 50000) == 0
+        assert event.highest_observed_market_cap == 70000
+        assert event.highest_observed_at == tracking_start + timedelta(minutes=65)
+        assert list_graduated_tokens(session)[0]["highest_observed_market_cap"] == 70000
+
+
+def test_graduation_reconciliation_uses_fresh_preferred_provider_history() -> None:
+    from app.models import MarketObservation
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        now = datetime.now(timezone.utc)
+        tracking_start = now - timedelta(hours=2)
+        chain = Chain(chain_name="robinhood_chain", chain_slug="robinhood", chain_id="4663")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+            first_seen_at=tracking_start,
+            is_graduated=True,
+        )
+        session.add(token)
+        session.flush()
+        session.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="dexscreener",
+                observed_at=tracking_start + timedelta(minutes=30),
+                market_cap=293_683,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="dexscreener",
+                observed_at=tracking_start + timedelta(minutes=60),
+                market_cap=294_008,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="fomo_family",
+                observed_at=tracking_start + timedelta(minutes=90),
+                market_cap=3_600,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="fomo_family",
+                observed_at=tracking_start + timedelta(minutes=120),
+                market_cap=3_700,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="fomo_family_metadata",
+                provider_name="fomo_family",
+                observed_at=now,
+                market_cap=3_700,
+                is_valid=False,
+            ),
+        ])
+        event = GraduationEvent(
+            token_id=token.id,
+            graduated_at=tracking_start + timedelta(minutes=60),
+            market_cap_at_graduation=294_008,
+            threshold_usd=50_000,
+            highest_observed_market_cap=294_008,
+            highest_observed_at=tracking_start + timedelta(minutes=60),
+        )
+        session.add(event)
+        session.commit()
+
+        assert list_graduated_tokens(session) == []
+        from app.features.graduated_tokens.service import count_graduated_tokens
+        from app.features.dashboard.service import get_overview
+
+        assert count_graduated_tokens(session) == 0
+        assert get_overview(session)["graduations"] == 0
+        assert reconcile_graduation_eligibility(session, 50_000) == 1
+        assert token.is_graduated is False
+        assert session.query(GraduationEvent).filter_by(token_id=token.id).count() == 0
+        assert list_graduated_tokens(session) == []
+
+
 def test_graduation_reconciliation_removes_only_ineligible_events() -> None:
     from app.models import DismissedToken, MarketObservation
 
@@ -247,7 +500,27 @@ def test_graduation_reconciliation_removes_only_ineligible_events() -> None:
             first_seen_at=tracking_start,
             is_graduated=True,
         )
-        session.add_all([invalid_token, high_rmc_token_without_event, eligible_token])
+        spike_token = Token(
+            chain_id=chain.id,
+            contract_address="unconfirmed-high-spike",
+            normalized_address="unconfirmed-high-spike",
+            first_seen_at=tracking_start,
+            is_graduated=True,
+        )
+        compacted_token = Token(
+            chain_id=chain.id,
+            contract_address="compacted-daily-history",
+            normalized_address="compacted-daily-history",
+            first_seen_at=tracking_start,
+            is_graduated=True,
+        )
+        session.add_all([
+            invalid_token,
+            high_rmc_token_without_event,
+            eligible_token,
+            spike_token,
+            compacted_token,
+        ])
         session.flush()
         session.add_all([
             MarketObservation(
@@ -278,6 +551,48 @@ def test_graduation_reconciliation_removes_only_ineligible_events() -> None:
                 market_cap=75000,
                 is_valid=True,
             ),
+            MarketObservation(
+                token_id=eligible_token.id,
+                source="scheduled_refresh",
+                observed_at=datetime(2026, 10, 22, 0, 30),
+                market_cap=75000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=spike_token.id,
+                source="scheduled_refresh",
+                observed_at=datetime(2026, 10, 21, 1),
+                market_cap=40000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=spike_token.id,
+                source="scheduled_refresh",
+                observed_at=datetime(2026, 10, 21, 1, 30),
+                market_cap=1_210_000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=spike_token.id,
+                source="scheduled_refresh",
+                observed_at=datetime(2026, 10, 21, 2),
+                market_cap=45000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=compacted_token.id,
+                source="scheduled_refresh",
+                observed_at=datetime(2026, 10, 21, 1),
+                market_cap=42000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=compacted_token.id,
+                source="scheduled_refresh",
+                observed_at=datetime(2026, 10, 22, 1),
+                market_cap=60000,
+                is_valid=True,
+            ),
         ])
         session.add_all([
             GraduationEvent(
@@ -294,10 +609,24 @@ def test_graduation_reconciliation_removes_only_ineligible_events() -> None:
                 highest_observed_at=datetime(2026, 10, 22),
                 threshold_usd=50000,
             ),
+            GraduationEvent(
+                token_id=spike_token.id,
+                graduated_at=datetime(2026, 10, 21, 1, 30),
+                highest_observed_market_cap=1_210_000,
+                highest_observed_at=datetime(2026, 10, 21, 1, 30),
+                threshold_usd=50000,
+            ),
+            GraduationEvent(
+                token_id=compacted_token.id,
+                graduated_at=datetime(2026, 10, 22, 1),
+                highest_observed_market_cap=60000,
+                highest_observed_at=datetime(2026, 10, 22, 1),
+                threshold_usd=50000,
+            ),
         ])
         session.commit()
 
-        assert reconcile_graduation_eligibility(session, 50000) == 1
+        assert reconcile_graduation_eligibility(session, 50000) == 2
         assert invalid_token.is_graduated is False
         assert session.query(GraduationEvent).filter_by(token_id=invalid_token.id).count() == 0
         assert session.query(DismissedToken).filter_by(token_id=invalid_token.id, restored=False).count() == 1
@@ -305,6 +634,10 @@ def test_graduation_reconciliation_removes_only_ineligible_events() -> None:
         assert session.query(GraduationEvent).filter_by(token_id=high_rmc_token_without_event.id).count() == 0
         assert eligible_token.is_graduated is True
         assert session.query(GraduationEvent).filter_by(token_id=eligible_token.id).count() == 1
+        assert spike_token.is_graduated is False
+        assert session.query(GraduationEvent).filter_by(token_id=spike_token.id).count() == 0
+        assert compacted_token.is_graduated is True
+        assert session.query(GraduationEvent).filter_by(token_id=compacted_token.id).count() == 1
 
 
 def test_scheduled_refresh_persists_market_and_activity_snapshot(monkeypatch) -> None:
@@ -396,6 +729,66 @@ def test_scheduled_refresh_persists_market_and_activity_snapshot(monkeypatch) ->
         assert history[0]["fomo_holder_count"] == 88
 
 
+def test_scheduled_refresh_ignores_isolated_market_cap_spike(monkeypatch) -> None:
+    import app.workers.market_refresh as market_refresh
+    from app.models import MarketObservation
+
+    market_caps = iter([1_210_000, 45000])
+
+    class MetricsClient:
+        def __init__(self, _base_url):
+            pass
+
+        def fetch_token_metrics_batch(self, _chain, addresses):
+            return {
+                address.lower(): {
+                    "market_cap": next(market_caps),
+                    "price": 0.12,
+                    "liquidity": 10000,
+                    "volume": 900,
+                    "provider_name": "dexscreener",
+                }
+                for address in addresses
+            }
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        now = datetime.now(timezone.utc)
+        chain = Chain(chain_name="robinhood_chain", chain_slug="robinhood", chain_id="4663")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+            first_seen_at=now - timedelta(hours=1),
+        )
+        session.add(token)
+        session.flush()
+        session.add(MarketObservation(
+            token_id=token.id,
+            source="scheduled_refresh",
+            provider_name="dexscreener",
+            observed_at=now - timedelta(minutes=30),
+            market_cap=40000,
+            liquidity=10000,
+            is_valid=True,
+        ))
+        session.commit()
+
+        monkeypatch.setattr(market_refresh, "SessionLocal", lambda: Session(engine))
+        monkeypatch.setattr(market_refresh, "DexScreenerClient", MetricsClient)
+        assert market_refresh.refresh_market_observations("https://example.invalid") == 1
+        assert market_refresh.refresh_market_observations("https://example.invalid") == 1
+
+        assert session.query(GraduationEvent).filter_by(token_id=token.id).count() == 0
+        assert session.query(MarketObservation).filter_by(
+            token_id=token.id,
+            source="scheduled_refresh",
+        ).count() == 3
+
+
 def test_market_observation_compaction_preserves_recent_first_and_peak_rows() -> None:
     import app.workers.market_refresh as market_refresh
     from app.models import MarketObservation
@@ -480,7 +873,7 @@ def test_scheduled_refresh_falls_back_for_tokens_missing_from_batch(monkeypatch)
         assert snapshot.liquidity == 4500
 
 
-def test_scheduled_refresh_uses_fresh_fomo_values_only_for_missing_dex_fields(monkeypatch) -> None:
+def test_scheduled_refresh_prefers_fresh_fomo_values_over_dex_fields(monkeypatch) -> None:
     import app.workers.market_refresh as market_refresh
     from app.models import MarketObservation
 
@@ -529,11 +922,106 @@ def test_scheduled_refresh_uses_fresh_fomo_values_only_for_missing_dex_fields(mo
         assert market_refresh.refresh_market_observations("https://example.invalid") == 1
         snapshot = session.query(MarketObservation).filter_by(token_id=token.id, source="scheduled_refresh").one()
 
-        assert snapshot.market_cap == 30000
+        assert snapshot.market_cap == 20000
         assert snapshot.price == 0.2
         assert snapshot.liquidity == 5000
         assert snapshot.volume == 700
-        assert snapshot.raw_data["fomo_fallback_fields"] == ["price", "liquidity", "volume"]
+        assert snapshot.provider_name == "fomo_family"
+        assert snapshot.raw_data["market_cap_source"] == "fomo_family"
+        assert snapshot.raw_data["fomo_preferred_fields"] == [
+            "market_cap",
+            "price",
+            "liquidity",
+            "volume",
+        ]
+
+
+def test_scheduled_refresh_removes_graduation_invalidated_by_preferred_provider(monkeypatch) -> None:
+    import app.workers.market_refresh as market_refresh
+    from app.models import MarketObservation
+
+    class MetricsClient:
+        def __init__(self, _base_url):
+            pass
+
+        def fetch_token_metrics_batch(self, _chain, addresses):
+            return {
+                addresses[0].lower(): {
+                    "market_cap": 294000,
+                    "price": 0.1,
+                    "liquidity": 250000,
+                    "volume": 50000,
+                    "provider_name": "dexscreener",
+                }
+            }
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        now = datetime.now(timezone.utc)
+        chain = Chain(chain_name="robinhood_chain", chain_slug="robinhood", chain_id="4663")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+            first_seen_at=now - timedelta(hours=1),
+            is_graduated=True,
+        )
+        session.add(token)
+        session.flush()
+        session.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="dexscreener",
+                observed_at=now - timedelta(minutes=20),
+                market_cap=294000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="fomo_family",
+                observed_at=now - timedelta(minutes=10),
+                market_cap=3700,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="fomo_family_metadata",
+                provider_name="fomo_family",
+                observed_at=now,
+                market_cap=3700,
+                is_valid=False,
+            ),
+        ])
+        event = GraduationEvent(
+            token_id=token.id,
+            graduated_at=now - timedelta(minutes=20),
+            market_cap_at_graduation=294000,
+            threshold_usd=50000,
+            highest_observed_market_cap=294000,
+            highest_observed_at=now - timedelta(minutes=20),
+        )
+        session.add(event)
+        session.commit()
+
+        monkeypatch.setattr(market_refresh, "SessionLocal", lambda: Session(engine))
+        monkeypatch.setattr(market_refresh, "DexScreenerClient", MetricsClient)
+
+        assert market_refresh.refresh_market_observations("https://example.invalid") == 1
+        assert session.query(GraduationEvent).filter_by(token_id=token.id).count() == 0
+        assert token.is_graduated is False
+        latest = (
+            session.query(MarketObservation)
+            .filter_by(token_id=token.id, source="scheduled_refresh")
+            .order_by(MarketObservation.observed_at.desc())
+            .first()
+        )
+        assert latest.market_cap == 3700
+        assert latest.provider_name == "fomo_family"
 
 
 def test_scheduled_refresh_attributes_fomo_only_quotes_to_fomo(monkeypatch) -> None:
@@ -576,6 +1064,7 @@ def test_scheduled_refresh_attributes_fomo_only_quotes_to_fomo(monkeypatch) -> N
 
         assert snapshot.provider_name == "fomo_family"
         assert snapshot.market_cap == 22000
+        assert snapshot.raw_data["fomo_preferred_fields"] == ["market_cap"]
         assert snapshot.raw_data["fomo_fallback_fields"] == ["market_cap"]
 
 

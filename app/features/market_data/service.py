@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from app.features.tokens.service import token_display_data
 from sqlalchemy.orm import Session
 
+from app.features.tokens.service import token_display_data
+
+from app.features.market_data.provider_selection import (
+    confirmed_market_cap_peaks,
+    market_caps_are_consistent,
+    preferred_market_cap_sources,
+)
 from app.models import MarketObservation, Token
 
 PROVIDER_PRIORITY = ["fomo_family", "dexscreener", "helius"]
-
 
 def provider_priority_for_field(field_name: str, provider_map: dict[str, dict] | None = None) -> str | None:
     provider_map = provider_map or {}

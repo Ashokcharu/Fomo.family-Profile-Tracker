@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-AI_DISCOVERY_ELIGIBILITY_VERSION = 2
+AI_DISCOVERY_ELIGIBILITY_VERSION = 3
 
 
 def build_candidate_features(token: dict, settings) -> dict:
@@ -25,7 +25,8 @@ def build_candidate_features(token: dict, settings) -> dict:
     else:
         market_cap_score = 0.0
 
-    liquidity_score = min(15.0, liquidity / settings.minimum_liquidity_usd * 15) if liquidity is not None else 0.0
+    minimum_liquidity = settings.ai_discovery_min_liquidity_usd
+    liquidity_score = min(15.0, liquidity / minimum_liquidity * 15) if liquidity is not None and minimum_liquidity > 0 else 0.0
     buyer_score = min(10.0, buyers / 5 * 10)
     growth_score = min(35.0, max(0.0, growth_percent or 0.0))
     early_momentum_score = min(
@@ -52,10 +53,10 @@ def build_candidate_features(token: dict, settings) -> dict:
         strengths.append("Market cap is within the preferred discovery range.")
     if liquidity is None:
         risks.append("Liquidity data is unavailable.")
-    elif liquidity >= settings.minimum_liquidity_usd:
-        strengths.append("Liquidity meets the configured minimum.")
+    elif liquidity >= minimum_liquidity:
+        strengths.append("Liquidity meets the AI Discovery minimum.")
     else:
-        risks.append("Liquidity is below the configured minimum.")
+        risks.append(f"Liquidity is below the ${minimum_liquidity:,.0f} AI Discovery minimum.")
     if buyers >= 2:
         strengths.append(f"{buyers} followed traders have bought this token.")
     elif buyers == 0:

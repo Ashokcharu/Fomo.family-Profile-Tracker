@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.database import Base
-from app.features.tokens.service import create_or_get_token, token_identity_key
+from app.features.tokens.service import create_or_get_token, token_display_data, token_identity_key
 from app.features.favorites.service import count_favorites, delete_favorite, favorite_token, list_favorites
 from app.features.favorites.service import delete_favorites
 from app.features.risk_analysis.service import count_risk_findings, delete_risk_findings, list_risk_findings, record_rmc_drawdown_risk
@@ -140,6 +140,97 @@ def test_token_search_filters_all_token_history_tabs() -> None:
         assert [row["contract_address"] for row in list_graduated_tokens(session, limit=1, search="needle")] == ["needle-address"]
         assert [row["contract_address"] for row in list_risk_findings(session, limit=1, search="needle")] == ["needle-address"]
         assert [row["contract_address"] for row in list_dismissed_tokens(session, limit=1, search="needle")] == ["needle-address"]
+
+
+def test_token_display_falls_back_when_established_provider_is_stale() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        now = datetime.now(timezone.utc)
+        chain = Chain(chain_name="Fomo network 4663", chain_slug="fomo-network-4663", chain_id="4663")
+        session.add(chain)
+        session.flush()
+        token = Token(
+            chain_id=chain.id,
+            contract_address="0xabc",
+            normalized_address="0xabc",
+            first_seen_at=now - timedelta(hours=4),
+        )
+        session.add(token)
+        session.flush()
+        session.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="fomo_family",
+                observed_at=now - timedelta(hours=3),
+                market_cap=15000,
+                liquidity=6000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="fomo_family",
+                observed_at=now - timedelta(hours=2),
+                market_cap=16000,
+                liquidity=6000,
+                is_valid=True,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="scheduled_refresh",
+                provider_name="dexscreener",
+                observed_at=now - timedelta(minutes=5),
+                market_cap=300000,
+                liquidity=250000,
+                is_valid=True,
+            ),
+        ])
+        session.flush()
+        session.add(GraduationEvent(
+            token_id=token.id,
+            graduated_at=now - timedelta(minutes=5),
+            market_cap_at_graduation=300000,
+            threshold_usd=50000,
+            highest_observed_market_cap=300000,
+        ))
+        session.commit()
+
+        row = token_display_data(session, [token.id])[token.id]
+
+        assert row["market_cap"] == 300000
+        assert row["market_cap_source"] == "dexscreener"
+        assert row["reach_market_cap"] == 15000
+        assert row["reached_high_market_cap"] == 16000
+        assert "stale" not in row["market_data_warnings"]
+
+
+def test_observation_provider_filter_handles_many_preferred_tokens() -> None:
+    from app.features.market_data.provider_selection import confirmed_market_cap_peaks
+    from app.features.tokens.service import _observations_by_time
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        token_ids = list(range(1, 1201))
+        preferred_providers = {token_id: "fomo_family" for token_id in token_ids}
+        tracking_starts = {
+            token_id: datetime.now(timezone.utc)
+            for token_id in token_ids
+        }
+
+        assert _observations_by_time(
+            session,
+            token_ids,
+            latest=True,
+            preferred_provider_by_token=preferred_providers,
+        ) == {}
+        assert confirmed_market_cap_peaks(
+            session,
+            token_ids,
+            since_by_token=tracking_starts,
+        ) == {}
 
 
 def test_create_or_get_token_prevents_duplicate_chain_identity() -> None:
@@ -475,7 +566,9 @@ def test_holder_count_uses_latest_available_provider_value() -> None:
         ])
         session.commit()
 
-        assert list_tokens(session)[0]["fomo_holder_count"] == 99
+        row = list_tokens(session)[0]
+        assert row["fomo_holder_count"] == 99
+        assert row["fomo_holder_count_stale"] is True
 
 
 def test_rmc_drawdown_moves_token_to_risk_and_records_once() -> None:

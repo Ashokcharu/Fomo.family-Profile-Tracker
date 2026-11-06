@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Public, read-only AI Discovery candidate data.">
+    <title>AI Discovery Tokens</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/app.js" defer></script>
+</head>
+<body>
+    <main class="page-shell">
+        <header class="page-header">
+            <div>
+                <p class="eyebrow">FOMO FAMILY PROFILE TRACKER</p>
+                <h1>AI Discovery</h1>
+                <p class="subtitle">Live ranked candidates from the tracked-token analysis.</p>
+            </div>
+            <button id="refresh" type="button">Refresh</button>
+        </header>
+        <section class="summary" aria-label="Discovery status">
+            <div><span>Candidates</span><strong id="candidate-count">—</strong></div>
+            <div><span>Tokens scanned</span><strong id="tokens-scanned">—</strong></div>
+            <div><span>Last analysis</span><strong id="last-run">—</strong></div>
+            <label><span>Search candidates</span><input id="search" type="search" placeholder="Token, ticker, or contract"></label>
+        </section>
+        <p id="status" role="status" aria-live="polite">Loading AI Discovery candidates…</p>
+        <section class="table-panel" aria-label="AI Discovery candidates">
+            <div class="table-scroll">
+                <table>
+                    <thead><tr>
+                        <th scope="col">Rank</th><th scope="col">Token</th>
+                        <th scope="col" title="Hours since the token first entered AI Discovery">HH</th>
+                        <th scope="col">Fav.</th><th scope="col">Signal</th><th scope="col">Risk</th>
+                        <th scope="col">Data</th><th scope="col">MC</th><th scope="col">AI RMC</th>
+                        <th scope="col">AIRH</th><th scope="col">AI RMC→MC</th><th scope="col">AI RMC→AIRH</th>
+                        <th scope="col">Liq.</th><th scope="col">FU</th><th scope="col">FH</th>
+                    </tr></thead>
+                    <tbody id="candidates"><tr><td class="empty" colspan="15">Loading candidates…</td></tr></tbody>
+                </table>
+            </div>
+            <footer><span id="shown-count">0 candidates</span><span>Refreshes automatically every minute</span></footer>
+        </section>
+        <p class="disclaimer">Read-only market data and research signals. Not financial advice.</p>
+    </main>
+</body>
+</html>

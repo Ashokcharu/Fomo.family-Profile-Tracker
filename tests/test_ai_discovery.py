@@ -131,6 +131,121 @@ def test_discovery_uses_active_tokens_only_and_rejects_unknown_model_ids() -> No
         assert len(assessment.assessment_hash) == 64
 
 
+def test_ai_rh_uses_confirmed_observations_after_ai_baseline_only() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        baseline_at = datetime.now(timezone.utc)
+        tracking_start = baseline_at - timedelta(days=2)
+        token = Token(
+            chain_id=chain.id,
+            contract_address="ai-rh-regression",
+            normalized_address="ai-rh-regression",
+            first_seen_at=tracking_start,
+        )
+        db.add(token)
+        db.flush()
+        db.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=tracking_start + timedelta(minutes=1),
+                market_cap=10_000,
+                liquidity=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=tracking_start + timedelta(hours=1),
+                market_cap=143_631,
+                liquidity=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=baseline_at - timedelta(minutes=1),
+                market_cap=24_127,
+                liquidity=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=baseline_at + timedelta(minutes=1),
+                market_cap=26_000,
+                liquidity=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=baseline_at + timedelta(minutes=2),
+                market_cap=1_000_000,
+                liquidity=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=baseline_at + timedelta(minutes=3),
+                market_cap=26_100,
+                liquidity=10_000,
+            ),
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                observed_at=baseline_at + timedelta(minutes=4),
+                market_cap=26_200,
+                liquidity=10_000,
+            ),
+        ])
+        db.add(AIIntelligenceRecord(
+            token_id=token.id,
+            record_type="ai_discovery_baseline",
+            source="ai_discovery",
+            manually_entered=False,
+            created_at=baseline_at,
+            data={"ai_rmc": 24_127, "ai_rh": 143_631},
+        ))
+        db.add(AIIntelligenceRecord(
+            token_id=token.id,
+            record_type="ai_discovery_candidate",
+            source="ai_discovery",
+            manually_entered=False,
+            created_at=baseline_at,
+            data={
+                "token_id": token.id,
+                "run_id": "regression-run",
+                "rank": 1,
+                "tokens_scanned": 1,
+                "last_run_at": baseline_at.isoformat(),
+                "ai_discovery_since": baseline_at.isoformat(),
+                "ai_rmc": 24_127,
+                "ai_rh": 143_631,
+                "heuristic_score": 70,
+                "score": 70,
+                "continuation_adjustment": 0,
+                "review_mode": "signal_only",
+                "inactive": False,
+            },
+        ))
+        db.commit()
+
+        service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
+        candidate = service.get_status(db)["candidates"][0]
+
+        assert candidate["market_cap"] == 26_200
+        assert candidate["ai_rh"] == 26_200
+        assert db.query(AIIntelligenceRecord).filter_by(
+            token_id=token.id,
+            record_type="ai_discovery_baseline",
+        ).one().data["ai_rh"] == 26_200
+        assert db.query(AIIntelligenceRecord).filter_by(
+            token_id=token.id,
+            record_type="ai_discovery_candidate",
+        ).one().data["ai_rh"] == 26_200
+
+
 def test_discovery_falls_back_to_tracked_signals_when_ollama_is_unavailable() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -544,6 +659,74 @@ def test_early_positive_movement_gets_a_bounded_momentum_signal() -> None:
     assert stronger_growth["score_breakdown"]["early_momentum"] == 25.0
 
 
+def test_ai_discovery_requires_minimum_liquidity_and_hides_stale_candidates() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as db:
+        chain = Chain(chain_name="Base", chain_slug="base", chain_id="8453")
+        db.add(chain)
+        db.flush()
+        below_threshold = Token(
+            chain_id=chain.id,
+            contract_address="below-liquidity",
+            normalized_address="below-liquidity",
+        )
+        at_threshold = Token(
+            chain_id=chain.id,
+            contract_address="at-liquidity",
+            normalized_address="at-liquidity",
+        )
+        db.add_all([below_threshold, at_threshold])
+        db.flush()
+        add_ai_baseline(db, below_threshold.id, 10_000)
+        add_ai_baseline(db, at_threshold.id, 10_000)
+        observed_at = datetime.now(timezone.utc)
+        db.add_all([
+            MarketObservation(
+                token_id=below_threshold.id,
+                source="test",
+                observed_at=observed_at,
+                market_cap=12_000,
+                liquidity=2_499,
+            ),
+            MarketObservation(
+                token_id=at_threshold.id,
+                source="test",
+                observed_at=observed_at,
+                market_cap=12_000,
+                liquidity=2_500,
+            ),
+        ])
+        db.commit()
+
+        service = AIDataService(
+            Settings(ai_discovery_enabled=True, ai_discovery_min_liquidity_usd=2_500),
+            StubOllama(False),
+        )
+        result = service.run_discovery(db, use_model=False)
+
+        assert [candidate["token_id"] for candidate in result["candidates"]] == [at_threshold.id]
+
+        db.add(MarketObservation(
+            token_id=at_threshold.id,
+            source="test",
+            observed_at=observed_at + timedelta(seconds=5),
+            market_cap=12_000,
+            liquidity=2_499,
+        ))
+        db.add(AIIntelligenceRecord(
+            token_id=at_threshold.id,
+            record_type="ai_discovery_top_pick",
+            source="ai_discovery",
+            manually_entered=False,
+            data={"active": True, "token_id": at_threshold.id},
+        ))
+        db.commit()
+
+        assert service.get_status(db)["candidates"] == []
+        assert service.get_status(db)["top_picks"] == []
+
+
 def test_growth_gate_allows_automatic_reentry_and_reuses_unchanged_ollama_assessment() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -661,12 +844,14 @@ def test_stale_ai_baseline_does_not_override_tracked_growth_eligibility() -> Non
                 source="test",
                 observed_at=now - timedelta(minutes=5),
                 market_cap=8_716.72,
+                liquidity=10_000,
             ),
             MarketObservation(
                 token_id=token.id,
                 source="test",
                 observed_at=now,
                 market_cap=8_723.46,
+                liquidity=10_000,
             ),
             AIIntelligenceRecord(
                 token_id=token.id,
@@ -718,12 +903,14 @@ def test_status_hides_saved_candidate_that_no_longer_meets_growth_gate() -> None
                 source="test",
                 observed_at=now - timedelta(minutes=5),
                 market_cap=10_000,
+                liquidity=10_000,
             ),
             MarketObservation(
                 token_id=token.id,
                 source="test",
                 observed_at=now,
                 market_cap=10_900,
+                liquidity=10_000,
             ),
             AIIntelligenceRecord(
                 token_id=token.id,
@@ -755,6 +942,7 @@ def test_status_hides_saved_candidate_that_no_longer_meets_growth_gate() -> None
             source="test",
             observed_at=now + timedelta(seconds=1),
             market_cap=12_000,
+            liquidity=10_000,
         ))
         db.commit()
 
@@ -931,6 +1119,7 @@ def test_active_top_picks_include_current_token_image_for_existing_records() -> 
                 source="test",
                 observed_at=datetime.now(timezone.utc),
                 market_cap=6_000,
+                liquidity=2_500,
                 raw_data={"image_url": "https://cdn.example/image-token.png"},
             ),
         ])
@@ -971,6 +1160,7 @@ def test_removing_top_pick_refills_from_latest_eligible_candidate() -> None:
                 "ai_growth_multiple": 1.2,
                 "growth_multiple": 1.2,
                 "market_cap": 6_000,
+                "liquidity": 5_000,
             }
             for index, token in enumerate(tokens)
         ]
@@ -991,6 +1181,15 @@ def test_removing_top_pick_refills_from_latest_eligible_candidate() -> None:
             manually_entered=False,
             data={**candidates[0], "active": True},
         ))
+        db.add_all([
+            MarketObservation(
+                token_id=token.id,
+                source="test",
+                market_cap=6_000,
+                liquidity=5_000,
+            )
+            for token in tokens
+        ])
         db.commit()
 
         service = AIDataService(Settings(ai_discovery_enabled=True), StubOllama(False))
@@ -1067,6 +1266,12 @@ def test_automatic_feedback_tracks_airmc_drawdown_and_three_x_high() -> None:
             source="test",
             observed_at=observed_at + timedelta(seconds=2),
             market_cap=15_000,
+        ))
+        db.add(MarketObservation(
+            token_id=token.id,
+            source="test",
+            observed_at=observed_at + timedelta(seconds=3),
+            market_cap=15_100,
         ))
         db.commit()
         service.run_discovery(db, use_model=False)

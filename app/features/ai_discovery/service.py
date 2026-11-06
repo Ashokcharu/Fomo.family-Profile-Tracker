@@ -18,6 +18,7 @@ from app.features.ai_discovery.candidate_features import (
     build_candidate_features,
 )
 from app.features.ai_discovery.risk import build_risk_assessments
+from app.features.market_data.service import confirmed_market_cap_peaks
 from app.features.tokens.service import list_active_token_ids, list_all_active_tokens, token_display_data
 from app.integrations.ollama.client import OllamaClient
 from app.integrations.ollama.prompts import build_discovery_prompt
@@ -125,6 +126,8 @@ class AIDataService:
                     or current is None
                     or current.get("growth_percent") is None
                     or current["growth_percent"] < self.settings.ai_discovery_min_growth_percent
+                    or current.get("liquidity") is None
+                    or current["liquidity"] < self.settings.ai_discovery_min_liquidity_usd
                 ):
                     continue
                 candidate = {
@@ -145,6 +148,7 @@ class AIDataService:
         if candidates:
             candidate_ids = [candidate["token_id"] for candidate in candidates]
             baselines = self._records_by_token(db, "ai_discovery_baseline", candidate_ids)
+            confirmed_ai_highs = self._confirmed_ai_highs(db, candidate_ids, baselines)
             feedback = self._latest_feedback(db, candidate_ids)
             favorited_ids = {
                 token_id for (token_id,) in db.query(Favorite.token_id)
@@ -155,16 +159,8 @@ class AIDataService:
             for candidate in candidates:
                 baseline = baselines.get(candidate["token_id"])
                 baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
-                candidate["ai_rh"] = max(
-                    (value for value in (
-                        candidate.get("ai_rh"),
-                        baseline_data.get("ai_rh"),
-                        baseline_data.get("ai_rmc"),
-                        candidate.get("market_cap"),
-                    ) if value is not None),
-                    default=None,
-                )
-                if baseline and baseline_data.get("ai_rh") is None:
+                candidate["ai_rh"] = confirmed_ai_highs.get(candidate["token_id"])
+                if baseline and baseline_data.get("ai_rh") != candidate["ai_rh"]:
                     baseline.data = {**baseline_data, "ai_rh": candidate["ai_rh"]}
                 rating = feedback.get(candidate["token_id"])
                 adjustment = FEEDBACK_ADJUSTMENT if rating == "positive" else -FEEDBACK_ADJUSTMENT if rating == "negative" else 0.0
@@ -192,6 +188,7 @@ class AIDataService:
             )
             for rank, candidate in enumerate(candidates, start=1):
                 candidate["rank"] = rank
+            self._persist_candidate_ai_highs(db, candidates)
         self._update_top_picks(db, candidates, {})
         db.commit()
         top_picks = self._active_top_picks(db)
@@ -313,6 +310,8 @@ class AIDataService:
                 and tracked_growth_percent >= minimum_growth
                 and market_cap is not None
                 and market_cap > 0
+                and token.get("liquidity") is not None
+                and token["liquidity"] >= self.settings.ai_discovery_min_liquidity_usd
             )
             if eligible and token_id not in prior_candidates:
                 ai_rmc = market_cap
@@ -386,6 +385,8 @@ class AIDataService:
             candidate for candidate in token_features
             if candidate["growth_percent"] is not None
             and candidate["growth_percent"] >= minimum_growth
+            and candidate["liquidity"] is not None
+            and candidate["liquidity"] >= self.settings.ai_discovery_min_liquidity_usd
         ]
         risk_by_token = build_risk_assessments(
             db,
@@ -422,38 +423,12 @@ class AIDataService:
             {candidate["token_id"] for candidate in candidates} | active_pick_ids
         ) & set(baselines)
         if ai_tracking_ids:
-            observed_ai_highs = dict(
-                db.query(MarketObservation.token_id, func.max(MarketObservation.market_cap))
-                .join(
-                    AIIntelligenceRecord,
-                    and_(
-                        MarketObservation.token_id == AIIntelligenceRecord.token_id,
-                        AIIntelligenceRecord.record_type == "ai_discovery_baseline",
-                        AIIntelligenceRecord.source == "ai_discovery",
-                    ),
-                )
-                .filter(
-                    AIIntelligenceRecord.token_id.in_(ai_tracking_ids),
-                    MarketObservation.observed_at > AIIntelligenceRecord.created_at,
-                    MarketObservation.is_valid.is_(True),
-                    MarketObservation.market_cap.is_not(None),
-                )
-                .group_by(MarketObservation.token_id)
-                .all()
-            )
+            confirmed_ai_highs = self._confirmed_ai_highs(db, ai_tracking_ids, baselines)
             for token_id in ai_tracking_ids:
                 baseline = baselines[token_id]
                 baseline_data = baseline.data if isinstance(baseline.data, dict) else {}
                 candidate = feature_by_id[token_id]
-                candidate["ai_rh"] = max(
-                    (value for value in (
-                        baseline_data.get("ai_rh"),
-                        baseline_data.get("ai_rmc"),
-                        observed_ai_highs.get(token_id),
-                        candidate.get("market_cap"),
-                    ) if value is not None),
-                    default=None,
-                )
+                candidate["ai_rh"] = confirmed_ai_highs[token_id]
                 baseline.data = {**baseline_data, "ai_rh": candidate["ai_rh"]}
         run_id = uuid4().hex
         model_candidate = candidates[0] if candidates else None
@@ -549,6 +524,11 @@ class AIDataService:
             feature = feature_by_id.get(token_id)
             if feature is None:
                 reason = "no_longer_eligible"
+            elif (
+                feature.get("liquidity") is None
+                or feature["liquidity"] < self.settings.ai_discovery_min_liquidity_usd
+            ):
+                reason = "liquidity_below_threshold"
             elif feature.get("growth_percent") is None or feature["growth_percent"] < minimum_growth:
                 reason = "growth_below_threshold"
             elif feature.get("market_cap") is not None and feature["market_cap"] > 0:
@@ -746,6 +726,10 @@ class AIDataService:
             .order_by(AIIntelligenceRecord.id.desc())
             .all()
         )
+        confirmed_ai_highs = self._confirmed_ai_highs(
+            db,
+            [record.token_id for record in excluded if record.token_id is not None],
+        )
         results: list[dict[str, Any]] = []
         for record in excluded:
             if record.token_id is None:
@@ -781,26 +765,8 @@ class AIDataService:
                 merged["price"] = latest_market.price
                 merged["source"] = latest_market.source
 
-            baseline = (
-                db.query(AIIntelligenceRecord)
-                .filter(
-                    AIIntelligenceRecord.token_id == record.token_id,
-                    AIIntelligenceRecord.record_type == "ai_discovery_baseline",
-                    AIIntelligenceRecord.source == "ai_discovery",
-                )
-                .order_by(AIIntelligenceRecord.id.desc())
-                .first()
-            )
-            baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
-            ai_rh_values = [
-                merged.get("ai_rh"),
-                baseline_data.get("ai_rh"),
-                baseline_data.get("ai_rmc"),
-                merged.get("market_cap"),
-            ]
-            ai_rh = max((value for value in ai_rh_values if value is not None), default=None)
-            if ai_rh is not None:
-                merged["ai_rh"] = ai_rh
+            ai_rh = confirmed_ai_highs.get(record.token_id)
+            merged["ai_rh"] = ai_rh
 
             results.append({
                 "token_id": record.token_id,
@@ -901,6 +867,59 @@ class AIDataService:
         )
         return {record.token_id: record for record in records}
 
+    def _confirmed_ai_highs(
+        self,
+        db: Session,
+        token_ids: set[int] | list[int],
+        baselines: dict[int, AIIntelligenceRecord] | None = None,
+    ) -> dict[int, float | None]:
+        unique_ids = set(token_ids)
+        if not unique_ids:
+            return {}
+        baseline_records = baselines or self._records_by_token(
+            db,
+            "ai_discovery_baseline",
+            list(unique_ids),
+        )
+        tracked_baselines = {
+            token_id: baseline
+            for token_id, baseline in baseline_records.items()
+            if token_id in unique_ids
+        }
+        peaks = confirmed_market_cap_peaks(
+            db,
+            set(tracked_baselines),
+            {token_id: baseline.created_at for token_id, baseline in tracked_baselines.items()},
+        )
+        result: dict[int, float | None] = {token_id: None for token_id in unique_ids}
+        for token_id, baseline in tracked_baselines.items():
+            data = baseline.data if isinstance(baseline.data, dict) else {}
+            ai_rmc = _number_or_none(data.get("ai_rmc"))
+            values = [value for value in (ai_rmc, peaks.get(token_id, (None, None))[0]) if value is not None]
+            result[token_id] = max(values) if values else None
+        return result
+
+    def _persist_candidate_ai_highs(self, db: Session, candidates: list[dict[str, Any]]) -> None:
+        for candidate in candidates:
+            run_id = candidate.get("run_id")
+            if not run_id:
+                continue
+            record = (
+                db.query(AIIntelligenceRecord)
+                .filter(
+                    AIIntelligenceRecord.token_id == candidate["token_id"],
+                    AIIntelligenceRecord.record_type == "ai_discovery_candidate",
+                    AIIntelligenceRecord.source == "ai_discovery",
+                    AIIntelligenceRecord.data["run_id"].as_string() == run_id,
+                )
+                .order_by(AIIntelligenceRecord.id.desc())
+                .first()
+            )
+            if record is None or not isinstance(record.data, dict):
+                continue
+            if record.data.get("ai_rh") != candidate.get("ai_rh"):
+                record.data = {**record.data, "ai_rh": candidate.get("ai_rh")}
+
     def _latest_feedback(self, db: Session, token_ids: list[int]) -> dict[int, str]:
         if not token_ids:
             return {}
@@ -926,31 +945,11 @@ class AIDataService:
         baselines: dict[int, AIIntelligenceRecord],
     ) -> dict[int, str]:
         feedback = self._latest_feedback(db, [candidate["token_id"] for candidate in candidates])
-        baseline_ids = [baseline.id for baseline in baselines.values()]
-        observed_highs = {}
-        if baseline_ids:
-            observed_highs = dict(
-                db.query(
-                    MarketObservation.token_id,
-                    func.max(MarketObservation.market_cap),
-                )
-                .join(
-                    AIIntelligenceRecord,
-                    and_(
-                        AIIntelligenceRecord.token_id == MarketObservation.token_id,
-                        AIIntelligenceRecord.record_type == "ai_discovery_baseline",
-                        AIIntelligenceRecord.source == "ai_discovery",
-                    ),
-                )
-                .filter(
-                    AIIntelligenceRecord.id.in_(baseline_ids),
-                    MarketObservation.is_valid.is_(True),
-                    MarketObservation.market_cap.is_not(None),
-                    MarketObservation.observed_at >= AIIntelligenceRecord.created_at,
-                )
-                .group_by(MarketObservation.token_id)
-                .all()
-            )
+        observed_highs = self._confirmed_ai_highs(
+            db,
+            [candidate["token_id"] for candidate in candidates],
+            baselines,
+        )
         for candidate in candidates:
             token_id = candidate["token_id"]
             baseline = baselines.get(token_id)
@@ -960,10 +959,7 @@ class AIDataService:
             if not ai_rmc or current_market_cap is None:
                 continue
 
-            observed_high = max(
-                current_market_cap,
-                observed_highs.get(token_id) or ai_rmc,
-            )
+            observed_high = observed_highs.get(token_id) or ai_rmc
             previous_rating = feedback.get(token_id)
             if observed_high >= ai_rmc * 3:
                 rating = "positive"
@@ -1010,22 +1006,25 @@ class AIDataService:
                 picks.append({**data, "token_id": record.token_id})
         display_data = token_display_data(db, [pick["token_id"] for pick in picks])
         baselines = self._records_by_token(db, "ai_discovery_baseline", [pick["token_id"] for pick in picks])
+        confirmed_ai_highs = self._confirmed_ai_highs(
+            db,
+            [pick["token_id"] for pick in picks],
+            baselines,
+        )
+        eligible_picks = []
         for pick in picks:
             current = display_data.get(pick["token_id"], {})
+            if (
+                current.get("liquidity") is None
+                or current["liquidity"] < self.settings.ai_discovery_min_liquidity_usd
+            ):
+                continue
+            eligible_picks.append(pick)
             for key in ("name", "ticker", "contract_address", "image_url", "chain_name", "fomo_url"):
                 pick[key] = current.get(key) or pick.get(key)
-            baseline = baselines.get(pick["token_id"])
-            baseline_data = baseline.data if baseline and isinstance(baseline.data, dict) else {}
-            pick["ai_rh"] = max(
-                (value for value in (
-                    pick.get("ai_rh"),
-                    baseline_data.get("ai_rh"),
-                    baseline_data.get("ai_rmc"),
-                    pick.get("market_cap"),
-                ) if value is not None),
-                default=None,
-            )
-        return picks[:MAX_TOP_PICKS]
+            pick["liquidity"] = current["liquidity"]
+            pick["ai_rh"] = confirmed_ai_highs.get(pick["token_id"])
+        return eligible_picks[:MAX_TOP_PICKS]
 
     def _update_top_picks(
         self,
@@ -1053,6 +1052,14 @@ class AIDataService:
             record for record in records
             if isinstance(record.data, dict) and record.data.get("active")
         ]
+        current_market_data = token_display_data(
+            db,
+            [record.token_id for record in active_records if record.token_id is not None],
+        )
+        confirmed_ai_highs = self._confirmed_ai_highs(
+            db,
+            [record.token_id for record in active_records if record.token_id is not None],
+        )
         for record in active_records:
             data = dict(record.data)
             if record.token_id not in active_token_ids:
@@ -1063,9 +1070,23 @@ class AIDataService:
                 continue
             current = feature_by_id.get(record.token_id) or next(
                 (candidate for candidate in candidates if candidate["token_id"] == record.token_id),
-                None,
+                current_market_data.get(record.token_id),
             )
             current = dict(current or {})
+            if (
+                current.get("liquidity") is None
+                or current["liquidity"] < self.settings.ai_discovery_min_liquidity_usd
+            ):
+                data["active"] = False
+                data["outcome"] = "liquidity_below_threshold"
+                data["completed_at"] = datetime.now(timezone.utc).isoformat()
+                record.data = data
+                continue
+            data["ai_rh"] = (
+                current["ai_rh"]
+                if current.get("ai_rh") is not None
+                else confirmed_ai_highs.get(record.token_id)
+            )
             latest_market_cap = (
                 db.query(MarketObservation.market_cap)
                 .filter(
@@ -1119,8 +1140,6 @@ class AIDataService:
                 default=None,
             )
             if current:
-                if current.get("ai_rh") is not None:
-                    data["ai_rh"] = max(data.get("ai_rh") or current["ai_rh"], current["ai_rh"])
                 ai_rmc = data.get("ai_rmc")
                 data["ai_growth_multiple"] = (
                     round(current["market_cap"] / ai_rmc, 3)

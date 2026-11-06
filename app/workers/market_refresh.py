@@ -5,14 +5,15 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, delete, func, select, union
+from sqlalchemy import case, delete, func, or_, select, union
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import SessionLocal
 from app.database import SessionLocal
 from app.features.dismissed_tokens.service import active_dismissed_token_ids
-from app.features.graduated_tokens.service import record_graduation_progress
+from app.features.graduated_tokens.service import market_cap_has_recent_confirmation, record_graduation_progress
+from app.features.market_data.service import confirmed_market_cap_peaks, preferred_market_cap_sources
 from app.features.risk_analysis.service import record_rmc_drawdown_risk
 from app.features.followed_users.performance import update_token_pick_market_caps
 from app.integrations.dexscreener.client import DexScreenerClient, dexscreener_chain_name
@@ -123,17 +124,21 @@ def refresh_market_observations(base_url: str) -> int:
         ) if tokens else {}
         fomo_holder_counts = _latest_fomo_holder_counts(db, [token.id for token, _, _ in tokens])
         fomo_market_metrics = _latest_fomo_market_metrics(db, [token.id for token, _, _ in tokens])
+        preferred_market_cap_providers = preferred_market_cap_sources(
+            db,
+            [token.id for token, _, _ in tokens],
+        )
 
         added = 0
         for token, chain_name, network_id in tokens:
             provider_chain = dexscreener_chain_name(chain_name, network_id)
             metrics = dict(metrics_by_token.get((provider_chain, token.contract_address.lower())) or {})
-            fomo_fallback_fields = []
+            fomo_preferred_fields = []
             for field, value in fomo_market_metrics.get(token.id, {}).items():
-                if metrics.get(field) is None:
+                if value is not None:
                     metrics[field] = value
-                    fomo_fallback_fields.append(field)
-            if fomo_fallback_fields and not metrics.get("provider_name"):
+                    fomo_preferred_fields.append(field)
+            if "market_cap" in fomo_preferred_fields:
                 metrics["provider_name"] = "fomo_family"
             token.name = metrics.get("name") or token.name
             token.ticker = metrics.get("symbol") or token.ticker
@@ -144,9 +149,14 @@ def refresh_market_observations(base_url: str) -> int:
             if not has_market_data:
                 continue
 
-            reach_market_cap = _reach_market_cap(db, token.id)
+            preferred_market_cap_source = preferred_market_cap_providers.get(token.id)
+            reach_market_cap = _reach_market_cap(
+                db,
+                token.id,
+                preferred_market_cap_source,
+            )
             initial_rmc = reach_market_cap
-            if initial_rmc is None:
+            if initial_rmc is None and preferred_market_cap_source is None:
                 initial_rmc = metrics.get("market_cap")
             graduation_event = graduation_events.get(token.id)
             has_eligible_reach_market_cap = initial_rmc is not None and initial_rmc < graduation_threshold
@@ -172,6 +182,13 @@ def refresh_market_observations(base_url: str) -> int:
                 graduation_events.pop(token.id, None)
                 graduation_event = None
             observed_at = datetime.now(timezone.utc)
+            market_cap_confirmed = market_cap_has_recent_confirmation(
+                db,
+                token.id,
+                metrics.get("market_cap"),
+                observed_at,
+                preferred_market_cap_source or metrics.get("provider_name"),
+            )
             db.add(MarketObservation(
                 token_id=token.id,
                 source="scheduled_refresh",
@@ -191,15 +208,35 @@ def refresh_market_observations(base_url: str) -> int:
                     "image_url": metrics.get("image_url"),
                     "fdv": metrics.get("fdv"),
                     "market_cap_source": (
-                        "fomo_family" if "market_cap" in fomo_fallback_fields
+                        "fomo_family" if "market_cap" in fomo_preferred_fields
                         else metrics.get("provider_name") if metrics.get("market_cap") is not None
                         else None
                     ),
-                    "fomo_fallback_fields": fomo_fallback_fields,
+                    "fomo_preferred_fields": fomo_preferred_fields,
+                    "fomo_fallback_fields": fomo_preferred_fields,
                 },
             ))
             update_token_pick_market_caps(db, token.id, metrics.get("market_cap"), observed_at)
-            if metrics.get("market_cap") is not None and (
+            market_cap_source = (
+                "fomo_family" if "market_cap" in fomo_preferred_fields
+                else metrics.get("provider_name")
+            )
+            if graduation_event is not None and preferred_market_cap_source == "fomo_family":
+                preferred_peak = confirmed_market_cap_peaks(
+                    db,
+                    {token.id},
+                    preferred_provider_by_token={token.id: "fomo_family"},
+                ).get(token.id)
+                if preferred_peak is None or preferred_peak[0] < graduation_threshold:
+                    db.delete(graduation_event)
+                    graduation_events.pop(token.id, None)
+                    token.is_graduated = False
+                    graduation_event = None
+            market_cap_matches_preferred_source = (
+                preferred_market_cap_source is None
+                or market_cap_source == preferred_market_cap_source
+            )
+            if metrics.get("market_cap") is not None and market_cap_matches_preferred_source and (
                 graduation_event is not None or has_eligible_reach_market_cap
             ):
                 graduation_event = record_graduation_progress(
@@ -211,10 +248,16 @@ def refresh_market_observations(base_url: str) -> int:
                     graduation_event,
                     liquidity_usd=metrics.get("liquidity"),
                     minimum_liquidity_usd=get_settings().minimum_liquidity_usd,
+                    market_cap_confirmed=market_cap_confirmed,
                 )
                 if graduation_event is not None:
                     graduation_events[token.id] = graduation_event
-            record_rmc_drawdown_risk(db, token, reach_market_cap, metrics.get("market_cap"))
+            record_rmc_drawdown_risk(
+                db,
+                token,
+                reach_market_cap,
+                metrics.get("market_cap") if market_cap_matches_preferred_source else None,
+            )
             added += 1
             if added % MARKET_WRITE_BATCH_SIZE == 0:
                 db.commit()
@@ -410,7 +453,11 @@ def _latest_fomo_market_metrics(db, token_ids: list[int]) -> dict[int, dict[str,
     return metrics
 
 
-def _reach_market_cap(db, token_id: int) -> float | None:
+def _reach_market_cap(
+    db,
+    token_id: int,
+    preferred_market_cap_source: str | None = None,
+) -> float | None:
     tracking_start = (
         db.query(func.coalesce(Token.first_seen_at, Token.created_at))
         .filter(Token.id == token_id)
@@ -418,17 +465,24 @@ def _reach_market_cap(db, token_id: int) -> float | None:
     )
     if tracking_start is None:
         return None
-    first_observation = (
-        db.query(MarketObservation.market_cap)
-        .filter(
-            MarketObservation.token_id == token_id,
-            MarketObservation.is_valid.is_(True),
-            MarketObservation.market_cap.is_not(None),
-            MarketObservation.observed_at >= tracking_start,
-        )
-        .order_by(MarketObservation.observed_at.asc(), MarketObservation.id.asc())
-        .first()
+    first_observation_query = db.query(MarketObservation.market_cap).filter(
+        MarketObservation.token_id == token_id,
+        MarketObservation.is_valid.is_(True),
+        MarketObservation.market_cap.is_not(None),
+        MarketObservation.observed_at >= tracking_start,
     )
+    if preferred_market_cap_source is not None:
+        matching_provider = MarketObservation.provider_name == preferred_market_cap_source
+        if preferred_market_cap_source == "fomo_family":
+            matching_provider = or_(
+                matching_provider,
+                MarketObservation.source == "fomo_family_discovery",
+            )
+        first_observation_query = first_observation_query.filter(matching_provider)
+    first_observation = first_observation_query.order_by(
+        MarketObservation.observed_at.asc(),
+        MarketObservation.id.asc(),
+    ).first()
     if first_observation is not None:
         return first_observation[0]
     first_discovery = (

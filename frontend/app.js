@@ -102,7 +102,7 @@ const columnDefinitions = {
         title: 'Current market cap; unavailable when the latest quote is stale or unverified',
         value: (row) => {
             const warnings = row.market_data_warnings || [];
-            const unreliable = ['no_data', 'stale', 'low_liquidity', 'liquidity_unknown', 'market_cap_basis_unknown'];
+            const unreliable = ['no_data', 'stale', 'market_cap_basis_unknown'];
             if (row.market_cap !== null && row.market_cap !== undefined && warnings.some((warning) => unreliable.includes(warning))) return '—';
             return compactMoney(row.market_cap ?? row.market_cap_at_favorite);
         },
@@ -110,14 +110,14 @@ const columnDefinitions = {
     marketUpdated: { label: 'Updated', title: 'Data updated', value: (row) => dateTime(row.observed_at) },
     price: { label: 'Price', value: (row) => money(row.price ?? row.price_at_favorite, true) },
     liquidity: { label: 'Liq.', title: 'Liquidity', value: (row) => marketDataStale(row) ? '—' : compactMoney(row.liquidity) },
-    holders: { label: 'FH', title: 'Fomo holders (FH)', value: (row) => marketDataStale(row) || row.fomo_holder_count === null || row.fomo_holder_count === undefined ? '—' : Number(row.fomo_holder_count).toLocaleString() },
+    holders: { label: 'FH', title: 'Fomo holders (FH)', value: (row) => marketDataStale(row) || row.fomo_holder_count_stale || row.fomo_holder_count === null || row.fomo_holder_count === undefined ? '—' : Number(row.fomo_holder_count).toLocaleString() },
     reachMc: { label: 'RMC', title: 'Reached market cap (RMC)', value: (row) => compactMoney(row.reach_market_cap) },
     reachHigh: { label: 'RH', title: 'All-time high since tracking (RH)', value: (row) => compactMoney(row.reached_high_market_cap) },
     growthCurrent: {
         label: 'RMC→MC',
         title: 'Growth from reached market cap to current market cap',
-        value: (row) => marketDataUnreliable(row) ? '—' : growthLabel(row.reach_market_cap, row.market_cap),
-        growthPercent: (row) => marketDataUnreliable(row) ? null : growthPercent(row.reach_market_cap, row.market_cap),
+        value: (row) => marketCapUnreliable(row) ? '—' : growthLabel(row.reach_market_cap, row.market_cap),
+        growthPercent: (row) => marketCapUnreliable(row) ? null : growthPercent(row.reach_market_cap, row.market_cap),
         action: 'growth',
     },
     growthPeak: {
@@ -341,9 +341,9 @@ function growthPercent(baseline, value) {
     return percentChange * 100;
 }
 
-function marketDataUnreliable(row) {
+function marketCapUnreliable(row) {
     const warnings = row.market_data_warnings || [];
-    return ['no_data', 'stale', 'low_liquidity', 'liquidity_unknown', 'market_cap_basis_unknown']
+    return ['no_data', 'stale', 'market_cap_basis_unknown']
         .some((warning) => warnings.includes(warning));
 }
 

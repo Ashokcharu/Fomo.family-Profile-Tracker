@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.features.graduated_tokens.service import count_graduated_tokens
 from app.features.tokens.service import active_token_count
 from app.models import (
     DismissedToken,
     DiscoveryEvent,
     Favorite,
     FollowedTrader,
-    GraduationEvent,
     RiskFinding,
     SecurityAnalysis,
     Token,
@@ -27,7 +27,7 @@ def get_overview(db: Session) -> dict:
             TraderTransactionEvent.event_type == "buy",
         ).count(),
         "favorites": db.query(Favorite).count(),
-        "graduations": db.query(GraduationEvent).count(),
+        "graduations": count_graduated_tokens(db),
         "risk_findings": db.query(RiskFinding).count(),
         "security_analyses": db.query(SecurityAnalysis).count(),
         "dismissed_tokens": db.query(DismissedToken).count(),
